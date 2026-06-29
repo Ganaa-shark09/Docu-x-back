@@ -8,13 +8,16 @@ env = environ.Env(
     DJANGO_DEBUG=(bool, False),
 )
 
-SECRET_KEY = env("DJANGO_SECRET_KEY", default="local-dev-secret-key")
+SECRET_KEY = env(
+    "DJANGO_SECRET_KEY",
+    default="local-dev-secret-key-change-in-production",
+)
 
 DEBUG = env.bool("DJANGO_DEBUG", default=False)
 
 ALLOWED_HOSTS = env.list(
     "DJANGO_ALLOWED_HOSTS",
-    default=["localhost", "127.0.0.1", "0.0.0.0"],
+    default=["localhost", "127.0.0.1", "0.0.0.0", "django"],
 )
 
 INSTALLED_APPS = [
@@ -34,8 +37,9 @@ INSTALLED_APPS = [
     "django_celery_results",
     "pgvector.django",
     # Local apps
-    "apps.accounts",
+    "apps.shared",
     "apps.tenants",
+    "apps.accounts",
     "apps.workspaces",
     "apps.documents",
     "apps.document_processing",
@@ -48,7 +52,6 @@ INSTALLED_APPS = [
     "apps.integrations",
     "apps.billing",
     "apps.notifications",
-    "apps.shared",
 ]
 
 MIDDLEWARE = [
@@ -81,6 +84,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "config.wsgi.application"
+ASGI_APPLICATION = "config.asgi.application"
 
 DATABASES = {
     "default": {
@@ -88,10 +92,12 @@ DATABASES = {
         "NAME": env("POSTGRES_DB", default="docux"),
         "USER": env("POSTGRES_USER", default="docux"),
         "PASSWORD": env("POSTGRES_PASSWORD", default="docux_password"),
-        "HOST": env("POSTGRES_HOST", default="localhost"),
+        "HOST": env("POSTGRES_HOST", default="postgres"),
         "PORT": env("POSTGRES_PORT", default="5432"),
     }
 }
+
+AUTH_USER_MODEL = "accounts.User"
 
 AUTH_PASSWORD_VALIDATORS = [
     {
@@ -145,12 +151,14 @@ CORS_ALLOWED_ORIGINS = env.list(
 
 CELERY_BROKER_URL = env(
     "CELERY_BROKER_URL",
-    default="redis://localhost:6379/0",
+    default="redis://redis:6379/0",
 )
+
 CELERY_RESULT_BACKEND = env(
     "CELERY_RESULT_BACKEND",
-    default="redis://localhost:6379/1",
+    default="redis://redis:6379/1",
 )
+
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
