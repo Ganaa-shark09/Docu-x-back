@@ -1,0 +1,88 @@
+services:
+  django:
+    build:
+      context: .
+      dockerfile: docker/local/django/Dockerfile
+    container_name: docux_django
+    command: /app/scripts/entrypoint.sh
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    env_file:
+      - envs/local/django.env
+      - envs/local/postgres.env
+      - envs/local/redis.env
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - docux_network
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: docux_postgres
+    volumes:
+      - docux_postgres_data:/var/lib/postgresql/data
+    env_file:
+      - envs/local/postgres.env
+    ports:
+      - "5432:5432"
+    networks:
+      - docux_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: docux_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - docux_redis_data:/data
+    networks:
+      - docux_network
+
+  celery_worker:
+    build:
+      context: .
+      dockerfile: docker/local/django/Dockerfile
+    container_name: docux_celery_worker
+    command: celery -A config worker -l info
+    volumes:
+      - .:/app
+    env_file:
+      - envs/local/django.env
+      - envs/local/postgres.env
+      - envs/local/redis.env
+    depends_on:
+      - django
+      - postgres
+      - redis
+    networks:
+      - docux_network
+
+  celery_beat:
+    build:
+      context: .
+      dockerfile: docker/local/django/Dockerfile
+    container_name: docux_celery_beat
+    command: celery -A config beat -l info
+    volumes:
+      - .:/app
+    env_file:
+      - envs/local/django.env
+      - envs/local/postgres.env
+      - envs/local/redis.env
+    depends_on:
+      - django
+      - postgres
+      - redis
+    networks:
+      - docux_network
+
+volumes:
+  docux_postgres_data:
+  docux_redis_data:
+
+networks:
+  docux_network:
+    driver: bridge
