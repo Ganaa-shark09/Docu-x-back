@@ -1,0 +1,14 @@
+-r base.txt
+
+ipython==8.27.0
+django-debug-toolbar==4.4.6
+
+pytest==8.3.2
+pytest-django==4.9.0
+factory-boy==3.3.1
+faker==28.4.1
+
+black==24.8.0
+isort==5.13.2
+ruff==0.6.4
+pre-commit==3.8.0
