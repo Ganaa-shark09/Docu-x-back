@@ -7,6 +7,7 @@ from apps.document_processing.services import (
     TextExtractionService,
 )
 from apps.documents.models import Document, DocumentProcessingJob
+from apps.vector_search.services import VectorIndexingService
 
 
 def _mark_job_running(document, job_type):
@@ -86,22 +87,23 @@ def process_document_pipeline(self, document_uuid):
         extraction_result = run_text_extraction(document.uuid)
         classification_result = run_document_classification(document.uuid)
         firewall_result = run_firewall_scan(document.uuid)
+        indexing_result = run_vector_indexing(document.uuid)
 
         document.refresh_from_db()
 
-        document.is_ai_ready = bool(document.is_ocr_completed)
-        document.is_indexed = False
+        document.is_ai_ready = bool(document.is_ocr_completed and document.is_indexed)
         document.status = (
             Document.Status.READY if document.is_ai_ready else Document.Status.FAILED
         )
 
         if not document.is_ai_ready:
-            document.processing_error = "No extractable text found in document."
+            document.processing_error = (
+                "Document processing completed, but document is not AI ready."
+            )
 
         document.save(
             update_fields=[
                 "is_ai_ready",
-                "is_indexed",
                 "status",
                 "processing_error",
                 "updated_at",
@@ -113,6 +115,7 @@ def process_document_pipeline(self, document_uuid):
             "text_extraction": extraction_result,
             "classification": classification_result,
             "firewall": firewall_result,
+            "indexing": indexing_result,
             "status": document.status,
         }
 
@@ -185,4 +188,38 @@ def run_firewall_scan(document_uuid):
 
     except Exception as exc:
         _mark_job_failed(job, exc)
+        raise
+
+
+def run_vector_indexing(document_uuid):
+    document = Document.objects.get(uuid=document_uuid)
+
+    chunking_job = _mark_job_running(document, DocumentProcessingJob.JobType.CHUNKING)
+    embedding_job = _mark_job_running(document, DocumentProcessingJob.JobType.EMBEDDING)
+    indexing_job = _mark_job_running(document, DocumentProcessingJob.JobType.INDEXING)
+
+    try:
+        result = VectorIndexingService.index_document(document)
+
+        _mark_job_success(
+            chunking_job,
+            {
+                "chunk_count": result.get("chunk_count", 0),
+            },
+        )
+        _mark_job_success(
+            embedding_job,
+            {
+                "embedding_provider": result.get("embedding_provider"),
+                "embedding_dimensions": result.get("embedding_dimensions"),
+            },
+        )
+        _mark_job_success(indexing_job, result)
+
+        return result
+
+    except Exception as exc:
+        _mark_job_failed(chunking_job, exc)
+        _mark_job_failed(embedding_job, exc)
+        _mark_job_failed(indexing_job, exc)
         raise

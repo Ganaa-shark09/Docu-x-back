@@ -1,0 +1,7 @@
+Invoice Number: INV-1001
+Vendor: Indovate Technologies
+Amount Due: 15000
+GST: 18%
+Payment Terms: 30 days
+
+This invoice is for AI document processing services and secure document intelligence platform development.
