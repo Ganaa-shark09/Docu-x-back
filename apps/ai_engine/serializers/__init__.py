@@ -5,6 +5,7 @@ from .ai_chat_serializers import (
     AIConversationListSerializer,
     AIMessageSerializer,
 )
+from .llm_provider_serializers import LLMProviderConfigSerializer
 
 __all__ = [
     "AIChatRequestSerializer",
@@ -12,4 +13,5 @@ __all__ = [
     "AIConversationDetailSerializer",
     "AIConversationListSerializer",
     "AIMessageSerializer",
+    "LLMProviderConfigSerializer",
 ]

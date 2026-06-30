@@ -2,6 +2,7 @@ from django.db import transaction
 
 from apps.ai_engine.models import AIConversation, AIMessage
 from apps.ai_engine.services.llm_gateway_service import LLMGatewayService
+from apps.ai_engine.services.llm_provider_config_service import LLMProviderConfigService
 from apps.ai_engine.services.prompt_builder_service import PromptBuilderService
 from apps.vector_search.services import VectorSearchService
 
@@ -46,10 +47,15 @@ class RAGChatService:
             retrieved_chunks=retrieved_chunks,
         )
 
+        provider_config = LLMProviderConfigService.get_default_config_for_company(
+            user.company
+        )
+
         llm_result = LLMGatewayService.generate_answer(
             question=message,
             retrieved_chunks=retrieved_chunks,
             prompt=prompt,
+            provider_config=provider_config,
         )
 
         assistant_message = AIMessage.objects.create(
@@ -68,6 +74,7 @@ class RAGChatService:
                 "sensitivity_label": sensitivity_label,
                 "department_uuid": str(department_uuid) if department_uuid else None,
                 "user_message_uuid": str(user_message.uuid),
+                "llm_metadata": llm_result.get("metadata", {}),
             },
         )
 
