@@ -24,6 +24,7 @@ class VectorSearchAPIView(APIView):
 
         results = VectorSearchService.search(
             company=request.user.company,
+            user=request.user,
             query=serializer.validated_data["query"],
             department_uuid=serializer.validated_data.get("department"),
             document_type=serializer.validated_data.get("document_type"),

@@ -9,6 +9,7 @@ from apps.documents.models import (
 )
 from apps.documents.services import (
     DocumentFileValidationService,
+    DocumentPermissionService,
     DocumentProcessingJobService,
 )
 from apps.document_processing.models import DocumentTextExtraction
@@ -75,6 +76,23 @@ class DocumentAccessPolicySerializer(serializers.ModelSerializer):
             "updated_at",
         ]
 
+    def validate_user(self, user):
+        request = self.context.get("request")
+
+        if user and request and user.company_id != request.user.company_id:
+            raise serializers.ValidationError("User does not belong to your company.")
+
+        return user
+
+    def validate(self, attrs):
+        user = attrs.get("user")
+        role = attrs.get("role")
+
+        if not user and not role:
+            raise serializers.ValidationError("Either user or role is required.")
+
+        return attrs
+
 
 class DocumentTextExtractionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -128,6 +146,7 @@ class DocumentListSerializer(serializers.ModelSerializer):
             "department",
             "department_name",
             "uploaded_by_email",
+            "current_user_access",
             "document_type",
             "status",
             "sensitivity_label",
@@ -143,6 +162,14 @@ class DocumentListSerializer(serializers.ModelSerializer):
             "updated_at",
         ]
         read_only_fields = fields
+
+    def get_current_user_access(self, obj):
+        request = self.context.get("request")
+
+        if not request:
+            return None
+
+        return DocumentPermissionService.get_highest_access_level(request.user, obj)
 
 
 class DocumentDetailSerializer(serializers.ModelSerializer):
@@ -167,6 +194,7 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             "department",
             "department_name",
             "uploaded_by_email",
+            "current_user_access",
             "document_type",
             "status",
             "sensitivity_label",

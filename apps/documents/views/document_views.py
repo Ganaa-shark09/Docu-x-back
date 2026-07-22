@@ -4,16 +4,20 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from apps.documents.models import Document, DocumentProcessingJob
-from apps.documents.services import DocumentProcessingJobService
-from apps.documents.tasks import process_document_pipeline
 from apps.documents.permissions import IsCompanyDocumentUser
 from apps.documents.serializers import (
+    DocumentAccessPolicySerializer,
     DocumentCreateSerializer,
     DocumentDetailSerializer,
     DocumentListSerializer,
     DocumentProcessingJobSerializer,
     DocumentUpdateSerializer,
 )
+from apps.documents.services import (
+    DocumentPermissionService,
+    DocumentProcessingJobService,
+)
+from apps.documents.tasks import process_document_pipeline
 
 
 class DocumentViewSet(viewsets.ModelViewSet):
@@ -40,9 +44,9 @@ class DocumentViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         queryset = (
-            Document.objects.filter(
-                company=user.company,
-                is_deleted=False,
+            DocumentPermissionService.get_accessible_document_queryset(
+                user=user,
+                required_access="view",
             )
             .select_related(
                 "company",
@@ -81,7 +85,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
             elif normalized in ["false", "0", "no"]:
                 queryset = queryset.filter(is_ai_ready=False)
 
-        return queryset
+        return queryset.distinct()
 
     def get_serializer_class(self):
         if self.action == "create":
@@ -100,6 +104,9 @@ class DocumentViewSet(viewsets.ModelViewSet):
             return [MultiPartParser, FormParser]
 
         return super().get_parser_classes()
+
+    def perform_create(self, serializer):
+        serializer.save()
 
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
@@ -171,3 +178,34 @@ class DocumentViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_202_ACCEPTED,
         )
+
+    @action(detail=True, methods=["get", "post"], url_path="access-policies")
+    def access_policies(self, request, uuid=None):
+        document = self.get_object()
+
+        if not DocumentPermissionService.has_document_access(
+            user=request.user,
+            document=document,
+            required_access="admin",
+        ):
+            return Response(
+                {"detail": "Admin access is required to manage document policies."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if request.method == "GET":
+            serializer = DocumentAccessPolicySerializer(
+                document.access_policies.filter(is_deleted=False),
+                many=True,
+                context=self.get_serializer_context(),
+            )
+            return Response(serializer.data)
+
+        serializer = DocumentAccessPolicySerializer(
+            data=request.data,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save(document=document)
+
+        return Response(serializer.data, status=status.HTTP_201_CREATED)

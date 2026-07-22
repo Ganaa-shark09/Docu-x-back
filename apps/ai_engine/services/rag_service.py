@@ -39,6 +39,7 @@ class RAGChatService:
 
         retrieved_chunks = VectorSearchService.search(
             company=user.company,
+            user=user,
             query=message,
             department_uuid=department_uuid,
             document_type=document_type,

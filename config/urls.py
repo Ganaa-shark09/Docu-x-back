@@ -15,6 +15,7 @@ urlpatterns = [
     ),
     # App APIs
     path("api/auth/", include("apps.accounts.urls")),
+    path("api/workspaces/", include("apps.workspaces.urls")),
     path("api/documents/", include("apps.documents.urls")),
     path("api/vector-search/", include("apps.vector_search.urls")),
     path("api/ai/", include("apps.ai_engine.urls")),

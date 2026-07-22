@@ -1,5 +1,6 @@
 from pgvector.django import CosineDistance
 
+from apps.documents.services import DocumentPermissionService
 from apps.vector_search.models import DocumentChunk
 from apps.vector_search.services.embedding_provider import EmbeddingProviderFactory
 
@@ -10,6 +11,7 @@ class VectorSearchService:
         cls,
         company,
         query,
+        user=None,
         department_uuid=None,
         document_type=None,
         sensitivity_label=None,
@@ -29,6 +31,17 @@ class VectorSearchService:
             .select_related("document", "department", "company")
             .annotate(distance=CosineDistance("embedding", query_embedding))
         )
+
+        if user:
+            allowed_document_ids = (
+                DocumentPermissionService.get_accessible_document_queryset(
+                    user=user,
+                    required_access="view",
+                    require_ai=True,
+                ).values_list("id", flat=True)
+            )
+
+            queryset = queryset.filter(document_id__in=allowed_document_ids)
 
         if department_uuid:
             queryset = queryset.filter(department__uuid=department_uuid)
