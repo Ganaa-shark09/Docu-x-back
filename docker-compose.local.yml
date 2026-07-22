@@ -16,6 +16,7 @@ services:
     depends_on:
       - postgres
       - redis
+      - ollama
     networks:
       - docux_network
 
@@ -57,6 +58,7 @@ services:
       - django
       - postgres
       - redis
+      - ollama
     networks:
       - docux_network
 
@@ -76,12 +78,24 @@ services:
       - django
       - postgres
       - redis
+      - ollama
+    networks:
+      - docux_network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: docux_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - docux_ollama_data:/root/.ollama
     networks:
       - docux_network
 
 volumes:
   docux_postgres_data:
   docux_redis_data:
+  docux_ollama_data:
 
 networks:
   docux_network:

@@ -8,6 +8,7 @@ from apps.tenants.models import Company
 class LLMProviderConfig(BaseModel):
     class ProviderType(models.TextChoices):
         LOCAL = "local", "Local Fallback"
+        OLLAMA = "ollama", "Ollama Local LLM"
         OPENAI = "openai", "OpenAI"
         AZURE_OPENAI = "azure_openai", "Azure OpenAI"
 
@@ -34,9 +35,10 @@ class LLMProviderConfig(BaseModel):
         help_text="OpenAI model name or local model name.",
     )
 
-    endpoint_url = models.URLField(
+    endpoint_url = models.CharField(
+        max_length=500,
         blank=True,
-        help_text="Azure/OpenAI-compatible endpoint URL if needed.",
+        help_text="LLM endpoint URL. Supports internal Docker URLs like http://ollama:11434.",
     )
 
     deployment_name = models.CharField(

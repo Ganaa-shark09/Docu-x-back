@@ -11,6 +11,7 @@ class LLMProviderConfigService:
                 company=company,
                 is_active=True,
                 is_default=True,
+                is_deleted=False,
             )
             .order_by("-updated_at")
             .first()
@@ -23,7 +24,20 @@ class LLMProviderConfigService:
 
     @classmethod
     def _build_env_fallback_config(cls, company):
-        provider = os.getenv("DEFAULT_LLM_PROVIDER", "local").lower()
+        provider = os.getenv("DEFAULT_LLM_PROVIDER", "ollama").lower()
+
+        if provider == "ollama":
+            return LLMProviderConfig(
+                company=company,
+                name="Environment Ollama",
+                provider_type=LLMProviderConfig.ProviderType.OLLAMA,
+                endpoint_url=os.getenv("OLLAMA_BASE_URL", "http://ollama:11434"),
+                model_name=os.getenv("OLLAMA_DEFAULT_MODEL", "llama3.2:1b"),
+                max_tokens=1200,
+                temperature=0.2,
+                is_active=True,
+                is_default=True,
+            )
 
         if provider == "openai" and os.getenv("OPENAI_API_KEY"):
             config = LLMProviderConfig(

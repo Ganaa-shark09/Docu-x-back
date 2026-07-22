@@ -2,6 +2,7 @@ from .llm_gateway_service import (
     AzureOpenAILLMProvider,
     LLMGatewayService,
     LocalFallbackLLMProvider,
+    OllamaLLMProvider,
     OpenAILLMProvider,
 )
 from .llm_provider_config_service import LLMProviderConfigService
@@ -13,6 +14,7 @@ __all__ = [
     "LLMGatewayService",
     "LLMProviderConfigService",
     "LocalFallbackLLMProvider",
+    "OllamaLLMProvider",
     "OpenAILLMProvider",
     "PromptBuilderService",
     "RAGChatService",
