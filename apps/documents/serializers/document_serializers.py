@@ -1,6 +1,8 @@
 from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
+from apps.data_firewall.models import FirewallScan
+from apps.document_processing.models import DocumentTextExtraction
 from apps.documents.models import (
     Document,
     DocumentAccessPolicy,
@@ -12,8 +14,6 @@ from apps.documents.services import (
     DocumentPermissionService,
     DocumentProcessingJobService,
 )
-from apps.document_processing.models import DocumentTextExtraction
-from apps.data_firewall.models import FirewallScan
 
 
 class DocumentProcessingJobSerializer(serializers.ModelSerializer):
@@ -72,6 +72,7 @@ class DocumentAccessPolicySerializer(serializers.ModelSerializer):
         ]
         read_only_fields = [
             "uuid",
+            "user_email",
             "created_at",
             "updated_at",
         ]
@@ -135,6 +136,7 @@ class DocumentListSerializer(serializers.ModelSerializer):
     uploaded_by_email = serializers.EmailField(
         source="uploaded_by.email", read_only=True
     )
+    current_user_access = serializers.SerializerMethodField()
 
     class Meta:
         model = Document
@@ -178,6 +180,7 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
     uploaded_by_email = serializers.EmailField(
         source="uploaded_by.email", read_only=True
     )
+    current_user_access = serializers.SerializerMethodField()
     versions = DocumentVersionSerializer(many=True, read_only=True)
     access_policies = DocumentAccessPolicySerializer(many=True, read_only=True)
     processing_jobs = DocumentProcessingJobSerializer(many=True, read_only=True)
@@ -222,6 +225,7 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             "company_name",
             "department_name",
             "uploaded_by_email",
+            "current_user_access",
             "status",
             "original_filename",
             "file_size",
@@ -241,6 +245,14 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_current_user_access(self, obj):
+        request = self.context.get("request")
+
+        if not request:
+            return None
+
+        return DocumentPermissionService.get_highest_access_level(request.user, obj)
 
 
 class DocumentCreateSerializer(serializers.ModelSerializer):

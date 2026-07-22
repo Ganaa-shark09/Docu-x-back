@@ -13,6 +13,15 @@ class AuditLog(BaseModel):
         AI_CONTEXT_BLOCKED = "ai_context_blocked", "AI Context Blocked"
         AI_PROVIDER_ROUTED = "ai_provider_routed", "AI Provider Routed"
         DOCUMENT_ACCESS = "document_access", "Document Access"
+        APPROVAL_CREATED = "approval_created", "Approval Created"
+        APPROVAL_ASSIGNED = "approval_assigned", "Approval Assigned"
+        APPROVAL_APPROVED = "approval_approved", "Approval Approved"
+        APPROVAL_REJECTED = "approval_rejected", "Approval Rejected"
+        APPROVAL_CHANGES_REQUESTED = (
+            "approval_changes_requested",
+            "Approval Changes Requested",
+        )
+        APPROVAL_COMMENT_ADDED = "approval_comment_added", "Approval Comment Added"
         SECURITY_EVENT = "security_event", "Security Event"
 
     class Severity(models.TextChoices):
