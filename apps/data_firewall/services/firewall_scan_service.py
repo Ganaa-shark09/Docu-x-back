@@ -24,22 +24,8 @@ class FirewallScanService:
         extraction = getattr(document, "text_extraction", None)
         text = extraction.extracted_text if extraction else ""
 
-        detected_patterns = []
-        redacted_text = text
-
-        for pattern_name, regex in cls.PATTERNS.items():
-            matches = regex.findall(text)
-
-            if matches:
-                detected_patterns.append(
-                    {
-                        "pattern": pattern_name,
-                        "count": len(matches),
-                    }
-                )
-                redacted_text = regex.sub(
-                    f"[REDACTED_{pattern_name.upper()}]", redacted_text
-                )
+        detected_patterns = cls.detect_patterns(text)
+        redacted_text = cls.redact_text(text)
 
         risk_level, decision = cls._calculate_risk(detected_patterns)
 
@@ -67,6 +53,35 @@ class FirewallScanService:
         )
 
         return scan
+
+    @classmethod
+    def detect_patterns(cls, text):
+        detected_patterns = []
+
+        for pattern_name, regex in cls.PATTERNS.items():
+            matches = regex.findall(text or "")
+
+            if matches:
+                detected_patterns.append(
+                    {
+                        "pattern": pattern_name,
+                        "count": len(matches),
+                    }
+                )
+
+        return detected_patterns
+
+    @classmethod
+    def redact_text(cls, text):
+        redacted_text = text or ""
+
+        for pattern_name, regex in cls.PATTERNS.items():
+            redacted_text = regex.sub(
+                f"[REDACTED_{pattern_name.upper()}]",
+                redacted_text,
+            )
+
+        return redacted_text
 
     @classmethod
     def _calculate_risk(cls, detected_patterns):

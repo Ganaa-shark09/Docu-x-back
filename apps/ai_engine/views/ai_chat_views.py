@@ -11,6 +11,15 @@ from apps.ai_engine.serializers import (
 from apps.ai_engine.services import RAGChatService
 
 
+def get_client_ip(request):
+    forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    return request.META.get("REMOTE_ADDR")
+
+
 class AIChatAPIView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -32,6 +41,8 @@ class AIChatAPIView(APIView):
             document_type=serializer.validated_data.get("document_type"),
             sensitivity_label=serializer.validated_data.get("sensitivity_label"),
             top_k=serializer.validated_data.get("top_k", 5),
+            ip_address=get_client_ip(request),
+            user_agent=request.META.get("HTTP_USER_AGENT", ""),
         )
 
         assistant_message = result["assistant_message"]
@@ -42,6 +53,7 @@ class AIChatAPIView(APIView):
                 "message_uuid": assistant_message.uuid,
                 "answer": assistant_message.content,
                 "sources": result["sources"],
+                "firewall": result["firewall"],
                 "model_provider": assistant_message.model_provider,
                 "model_name": assistant_message.model_name,
                 "usage": {

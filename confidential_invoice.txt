@@ -1,0 +1,6 @@
+Invoice Number: INV-9001
+Vendor: Secure Vendor
+Payment Terms: 30 days
+PAN ABCDE1234F
+Email: finance@example.com
+Amount Due: 25000
