@@ -6,6 +6,7 @@ from apps.audit.models import AuditLog
 from apps.audit.services import AuditLogService
 from apps.documents.models import DocumentAccessPolicy
 from apps.documents.services import DocumentPermissionService
+from apps.notifications.services import NotificationService
 
 
 class ApprovalWorkflowService:
@@ -38,6 +39,16 @@ class ApprovalWorkflowService:
             return True
 
         if approval_request.assigned_to_id == user.id:
+            return True
+
+        if (
+            approval_request.requested_by_id == user.id
+            and DocumentPermissionService.has_document_access(
+                user=user,
+                document=approval_request.document,
+                required_access=DocumentAccessPolicy.AccessLevel.REVIEW,
+            )
+        ):
             return True
 
         return DocumentPermissionService.has_document_access(
@@ -116,6 +127,11 @@ class ApprovalWorkflowService:
             },
         )
 
+        NotificationService.notify_approval_assigned(
+            approval_request=approval,
+            actor=user,
+        )
+
         return approval
 
     @classmethod
@@ -172,6 +188,13 @@ class ApprovalWorkflowService:
             },
         )
 
+        cls.sync_extraction_run_status(approval_request)
+
+        NotificationService.notify_approval_approved(
+            approval_request=approval_request,
+            actor=user,
+        )
+
         return approval_request
 
     @classmethod
@@ -221,6 +244,13 @@ class ApprovalWorkflowService:
                 "document_uuid": str(approval_request.document.uuid),
                 "review_type": approval_request.review_type,
             },
+        )
+
+        cls.sync_extraction_run_status(approval_request)
+
+        NotificationService.notify_approval_rejected(
+            approval_request=approval_request,
+            actor=user,
         )
 
         return approval_request
@@ -279,6 +309,13 @@ class ApprovalWorkflowService:
             },
         )
 
+        cls.sync_extraction_run_status(approval_request)
+
+        NotificationService.notify_approval_changes_requested(
+            approval_request=approval_request,
+            actor=user,
+        )
+
         return approval_request
 
     @classmethod
@@ -323,7 +360,40 @@ class ApprovalWorkflowService:
             },
         )
 
+        NotificationService.notify_approval_comment_added(
+            approval_request=approval_request,
+            comment=approval_comment,
+            actor=user,
+        )
+
         return approval_comment
+
+    @classmethod
+    def sync_extraction_run_status(cls, approval_request):
+        if approval_request.review_type != ApprovalRequest.ReviewType.EXTRACTION_REVIEW:
+            return
+
+        from apps.workflows.models import ExtractionRun
+
+        extraction_run = ExtractionRun.objects.filter(
+            approval_request_uuid=approval_request.uuid,
+            company=approval_request.company,
+            is_deleted=False,
+        ).first()
+
+        if not extraction_run:
+            return
+
+        if approval_request.status == ApprovalRequest.Status.APPROVED:
+            extraction_run.status = ExtractionRun.Status.APPROVED
+        elif approval_request.status == ApprovalRequest.Status.REJECTED:
+            extraction_run.status = ExtractionRun.Status.REJECTED
+        elif approval_request.status == ApprovalRequest.Status.CHANGES_REQUESTED:
+            extraction_run.status = ExtractionRun.Status.REVIEW_REQUIRED
+        else:
+            return
+
+        extraction_run.save(update_fields=["status", "updated_at"])
 
     @staticmethod
     def add_system_comment(approval_request, message):

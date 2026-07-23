@@ -22,6 +22,8 @@ class AuditLog(BaseModel):
             "Approval Changes Requested",
         )
         APPROVAL_COMMENT_ADDED = "approval_comment_added", "Approval Comment Added"
+        EXTRACTION_EXPORTED = "extraction_exported", "Extraction Exported"
+        EXPORT_BLOCKED = "export_blocked", "Export Blocked"
         SECURITY_EVENT = "security_event", "Security Event"
 
     class Severity(models.TextChoices):

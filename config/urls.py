@@ -18,6 +18,8 @@ urlpatterns = [
     path("api/workspaces/", include("apps.workspaces.urls")),
     path("api/documents/", include("apps.documents.urls")),
     path("api/approvals/", include("apps.approvals.urls")),
+    path("api/workflows/", include("apps.workflows.urls")),
+    path("api/notifications/", include("apps.notifications.urls")),
     path("api/vector-search/", include("apps.vector_search.urls")),
     path("api/ai/", include("apps.ai_engine.urls")),
 ]
