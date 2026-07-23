@@ -20,6 +20,7 @@ urlpatterns = [
     path("api/approvals/", include("apps.approvals.urls")),
     path("api/workflows/", include("apps.workflows.urls")),
     path("api/notifications/", include("apps.notifications.urls")),
+    path("api/dashboard/", include("apps.shared.dashboard_urls")),
     path("api/vector-search/", include("apps.vector_search.urls")),
     path("api/ai/", include("apps.ai_engine.urls")),
 ]
