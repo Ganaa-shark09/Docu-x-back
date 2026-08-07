@@ -1,56 +1,384 @@
+import re
 from pathlib import Path
 
-import pypdf
+import pdfplumber
 import pytesseract
-from PIL import Image
+from docx import Document as DocxDocument
+from openpyxl import load_workbook
+from PIL import Image, ImageEnhance, ImageFilter
 
 from apps.document_processing.models import DocumentTextExtraction
+from .image_understanding_service import ImageUnderstandingService
 
 
 class TextExtractionService:
-    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}
-    TEXT_EXTENSIONS = {".txt", ".csv"}
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
+    TEXT_EXTENSIONS = {".txt", ".csv", ".md", ".log"}
+    DOCX_EXTENSIONS = {".docx"}
+    EXCEL_EXTENSIONS = {".xlsx"}
 
     @classmethod
     def extract_for_document(cls, document):
-        file_path = Path(document.file.path)
-        extension = file_path.suffix.lower()
+        return cls.extract_text(document)
+
+    @classmethod
+    def extract_text(cls, document):
+        file_path = document.file.path
+        extension = Path(file_path).suffix.lower()
 
         if extension == ".pdf":
-            result = cls._extract_pdf_text(file_path)
-        elif extension in cls.IMAGE_EXTENSIONS:
-            result = cls._extract_image_text(file_path)
-        elif extension in cls.TEXT_EXTENSIONS:
-            result = cls._extract_plain_text(file_path)
-        else:
-            result = {
-                "text": "",
-                "page_count": 0,
-                "method": DocumentTextExtraction.ExtractionMethod.UNKNOWN,
-                "confidence": 0,
-                "metadata": {
-                    "warning": f"Text extraction not implemented for {extension}",
-                },
-            }
+            return cls.extract_pdf(document, file_path)
 
-        text = result["text"] or ""
+        if extension in cls.IMAGE_EXTENSIONS:
+            return cls.extract_image(document, file_path)
 
-        extraction, _ = DocumentTextExtraction.objects.update_or_create(
+        if extension in cls.TEXT_EXTENSIONS:
+            return cls.extract_plain_text(document, file_path)
+
+        if extension in cls.DOCX_EXTENSIONS:
+            return cls.extract_docx(document, file_path)
+
+        if extension in cls.EXCEL_EXTENSIONS:
+            return cls.extract_xlsx(document, file_path)
+
+        return cls.save_extraction(
             document=document,
-            defaults={
-                "extraction_method": result["method"],
-                "extracted_text": text,
-                "page_count": result["page_count"],
-                "character_count": len(text),
-                "word_count": len(text.split()),
-                "confidence_score": result["confidence"],
-                "metadata": result.get("metadata", {}),
+            text="",
+            extraction_method=DocumentTextExtraction.ExtractionMethod.UNKNOWN,
+            page_count=0,
+            confidence_score=0,
+            metadata={"error": f"Unsupported file extension: {extension}"},
+        )
+
+    @classmethod
+    def extract_pdf(cls, document, file_path):
+        pages_text = []
+
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                pages_text.append(page.extract_text() or "")
+
+        text = "\n\n".join(pages_text).strip()
+
+        return cls.save_extraction(
+            document=document,
+            text=text,
+            extraction_method=DocumentTextExtraction.ExtractionMethod.PDF_TEXT,
+            page_count=len(pages_text),
+            confidence_score=90 if text else 0,
+            metadata={"source": "pdfplumber"},
+        )
+
+    @classmethod
+    def extract_image(cls, document, file_path):
+        ocr_text = ""
+        ocr_error = ""
+
+        try:
+            image = Image.open(file_path)
+            prepared_image = cls.prepare_image_for_ocr(image)
+
+            raw_ocr = pytesseract.image_to_string(
+                prepared_image,
+                config="--psm 6",
+            )
+
+            ocr_text = cls.clean_ocr_text(raw_ocr)
+
+        except Exception as exc:
+            ocr_error = str(exc)
+            ocr_text = ""
+
+        vision_result = ImageUnderstandingService.generate_image_summary(
+            image_path=file_path,
+            ocr_text=ocr_text,
+        )
+
+        raw_visual_summary = (vision_result.get("summary") or "").strip()
+        visual_summary = raw_visual_summary
+        vision_discarded = False
+        vision_discarded_reason = ""
+
+        if ocr_text and raw_visual_summary:
+            if not cls.is_visual_summary_compatible_with_ocr(
+                visual_summary=raw_visual_summary,
+                ocr_text=ocr_text,
+            ):
+                visual_summary = ""
+                vision_discarded = True
+                vision_discarded_reason = (
+                    "Vision summary had low overlap with OCR text and was discarded "
+                    "to avoid hallucinated image interpretation."
+                )
+
+        text_parts = [
+            "Image/Screenshot analysis:",
+            f"File name: {document.original_filename}",
+        ]
+
+        if ocr_text:
+            text_parts.extend(
+                [
+                    "",
+                    "OCR-visible text. This is the primary source of truth:",
+                    ocr_text,
+                ]
+            )
+
+        if visual_summary:
+            text_parts.extend(
+                [
+                    "",
+                    "Visual summary. This is secondary to OCR:",
+                    visual_summary,
+                ]
+            )
+
+        if not ocr_text and not visual_summary:
+            text_parts.extend(
+                [
+                    "",
+                    "No reliable OCR text or visual summary could be extracted from this image.",
+                ]
+            )
+
+        combined_text = "\n".join(text_parts).strip()
+
+        confidence_score = 0
+        if ocr_text and visual_summary:
+            confidence_score = 88
+        elif ocr_text:
+            confidence_score = 82
+        elif visual_summary:
+            confidence_score = 65
+
+        return cls.save_extraction(
+            document=document,
+            text=combined_text,
+            extraction_method=DocumentTextExtraction.ExtractionMethod.OCR,
+            page_count=1,
+            confidence_score=confidence_score,
+            metadata={
+                "source": "ocr_first_ollama_vision_secondary",
+                "ocr_error": ocr_error,
+                "vision_provider": vision_result.get("provider"),
+                "vision_model": vision_result.get("model"),
+                "vision_error": vision_result.get("error"),
+                "vision_discarded": vision_discarded,
+                "vision_discarded_reason": vision_discarded_reason,
+                "has_ocr_text": bool(ocr_text),
+                "has_visual_summary": bool(visual_summary),
+                "raw_visual_summary_preview": raw_visual_summary[:1000],
+                "ocr_text_preview": ocr_text[:1000],
             },
         )
 
-        document.page_count = extraction.page_count
-        document.is_ocr_completed = bool(text.strip())
-        document.processing_error = ""
+    @staticmethod
+    def prepare_image_for_ocr(image):
+        image = image.convert("RGB")
+
+        width, height = image.size
+        scale = 2
+
+        if width < 1800:
+            image = image.resize((width * scale, height * scale))
+
+        image = image.convert("L")
+        image = ImageEnhance.Contrast(image).enhance(1.8)
+        image = ImageEnhance.Sharpness(image).enhance(1.5)
+        image = image.filter(ImageFilter.SHARPEN)
+
+        return image
+
+    @classmethod
+    def clean_ocr_text(cls, text):
+        if not text:
+            return ""
+
+        lines = []
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+
+            if not line:
+                continue
+
+            line = re.sub(r"\s+", " ", line)
+            line = line.replace("|", "I") if len(line) < 4 else line
+
+            # Drop obvious OCR garbage lines.
+            alpha_numeric_count = len(re.findall(r"[a-zA-Z0-9]", line))
+            if alpha_numeric_count < 2:
+                continue
+
+            lines.append(line)
+
+        # Remove repeated consecutive OCR lines.
+        deduped = []
+        previous = None
+
+        for line in lines:
+            if line == previous:
+                continue
+
+            deduped.append(line)
+            previous = line
+
+        return "\n".join(deduped).strip()
+
+    @classmethod
+    def is_visual_summary_compatible_with_ocr(cls, visual_summary, ocr_text):
+        ocr_terms = cls.extract_keywords(ocr_text)
+        visual_terms = cls.extract_keywords(visual_summary)
+
+        if len(ocr_terms) < 8:
+            return True
+
+        overlap = ocr_terms.intersection(visual_terms)
+
+        # If OCR is rich but visual summary has almost no overlap,
+        # the local vision model likely hallucinated.
+        return len(overlap) >= 3
+
+    @staticmethod
+    def extract_keywords(text):
+        stopwords = {
+            "the",
+            "and",
+            "for",
+            "with",
+            "this",
+            "that",
+            "from",
+            "there",
+            "have",
+            "has",
+            "are",
+            "was",
+            "were",
+            "you",
+            "your",
+            "into",
+            "about",
+            "visible",
+            "image",
+            "screenshot",
+            "screen",
+            "text",
+            "content",
+        }
+
+        return {
+            word
+            for word in re.findall(r"[a-zA-Z0-9]+", text.lower())
+            if len(word) >= 4 and word not in stopwords
+        }
+
+    @classmethod
+    def extract_plain_text(cls, document, file_path):
+        text = Path(file_path).read_text(encoding="utf-8", errors="ignore").strip()
+
+        return cls.save_extraction(
+            document=document,
+            text=text,
+            extraction_method=DocumentTextExtraction.ExtractionMethod.PLAIN_TEXT,
+            page_count=1,
+            confidence_score=95 if text else 0,
+            metadata={"source": "plain_text_reader"},
+        )
+
+    @classmethod
+    def extract_docx(cls, document, file_path):
+        doc = DocxDocument(file_path)
+
+        paragraphs = [
+            paragraph.text.strip()
+            for paragraph in doc.paragraphs
+            if paragraph.text.strip()
+        ]
+
+        table_lines = []
+
+        for table in doc.tables:
+            for row in table.rows:
+                values = [cell.text.strip() for cell in row.cells]
+                if any(values):
+                    table_lines.append(" | ".join(values))
+
+        text = "\n".join(paragraphs + table_lines).strip()
+
+        return cls.save_extraction(
+            document=document,
+            text=text,
+            extraction_method=DocumentTextExtraction.ExtractionMethod.PLAIN_TEXT,
+            page_count=1,
+            confidence_score=85 if text else 0,
+            metadata={"source": "python_docx"},
+        )
+
+    @classmethod
+    def extract_xlsx(cls, document, file_path):
+        workbook = load_workbook(file_path, read_only=True, data_only=True)
+
+        lines = []
+
+        for sheet in workbook.worksheets:
+            lines.append(f"Sheet: {sheet.title}")
+
+            for row in sheet.iter_rows(values_only=True):
+                values = [str(value).strip() for value in row if value is not None]
+                if values:
+                    lines.append(" | ".join(values))
+
+        text = "\n".join(lines).strip()
+
+        return cls.save_extraction(
+            document=document,
+            text=text,
+            extraction_method=DocumentTextExtraction.ExtractionMethod.PLAIN_TEXT,
+            page_count=len(workbook.worksheets),
+            confidence_score=80 if text else 0,
+            metadata={"source": "openpyxl"},
+        )
+
+    @classmethod
+    def save_extraction(
+        cls,
+        document,
+        text,
+        extraction_method,
+        page_count,
+        confidence_score,
+        metadata=None,
+    ):
+        field_names = {
+            field.name for field in DocumentTextExtraction._meta.get_fields()
+        }
+
+        defaults = {
+            "extraction_method": extraction_method,
+            "extracted_text": text or "",
+            "page_count": page_count,
+            "word_count": len((text or "").split()),
+            "confidence_score": confidence_score,
+            "metadata": metadata or {},
+        }
+
+        if "character_count" in field_names:
+            defaults["character_count"] = len(text or "")
+        elif "char_count" in field_names:
+            defaults["char_count"] = len(text or "")
+
+        extraction, _ = DocumentTextExtraction.objects.update_or_create(
+            document=document,
+            defaults=defaults,
+        )
+
+        document.page_count = page_count
+        document.is_ocr_completed = bool((text or "").strip())
+        document.processing_error = (
+            "" if (text or "").strip() else "No text could be extracted."
+        )
         document.save(
             update_fields=[
                 "page_count",
@@ -61,61 +389,3 @@ class TextExtractionService:
         )
 
         return extraction
-
-    @staticmethod
-    def _extract_pdf_text(file_path):
-        text_parts = []
-        page_count = 0
-
-        with open(file_path, "rb") as file_obj:
-            reader = pypdf.PdfReader(file_obj)
-            page_count = len(reader.pages)
-
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text_parts.append(page_text)
-
-        text = "\n\n".join(text_parts).strip()
-
-        confidence = 90 if text else 20
-
-        return {
-            "text": text,
-            "page_count": page_count,
-            "method": DocumentTextExtraction.ExtractionMethod.PDF_TEXT,
-            "confidence": confidence,
-            "metadata": {
-                "parser": "pypdf",
-            },
-        }
-
-    @staticmethod
-    def _extract_image_text(file_path):
-        image = Image.open(file_path)
-        text = pytesseract.image_to_string(image).strip()
-
-        confidence = 75 if text else 20
-
-        return {
-            "text": text,
-            "page_count": 1,
-            "method": DocumentTextExtraction.ExtractionMethod.OCR,
-            "confidence": confidence,
-            "metadata": {
-                "parser": "pytesseract",
-            },
-        }
-
-    @staticmethod
-    def _extract_plain_text(file_path):
-        text = file_path.read_text(encoding="utf-8", errors="ignore").strip()
-
-        return {
-            "text": text,
-            "page_count": 1,
-            "method": DocumentTextExtraction.ExtractionMethod.PLAIN_TEXT,
-            "confidence": 95 if text else 20,
-            "metadata": {
-                "parser": "plain_text",
-            },
-        }

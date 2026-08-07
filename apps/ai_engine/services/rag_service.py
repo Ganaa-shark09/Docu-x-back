@@ -6,6 +6,7 @@ from apps.ai_engine.services.llm_provider_config_service import LLMProviderConfi
 from apps.ai_engine.services.prompt_builder_service import PromptBuilderService
 from apps.audit.services import AuditLogService
 from apps.data_firewall.services import AIContextPolicyEnforcementService
+from apps.documents.models import Document
 from apps.vector_search.services import VectorSearchService
 
 
@@ -21,6 +22,7 @@ class RAGChatService:
         document_type=None,
         sensitivity_label=None,
         top_k=5,
+        scope=Document.Scope.INTERNAL,
         ip_address=None,
         user_agent="",
     ):
@@ -29,6 +31,7 @@ class RAGChatService:
             message=message,
             conversation_uuid=conversation_uuid,
             department_uuid=department_uuid,
+            scope=scope,
         )
 
         user_message = AIMessage.objects.create(
@@ -45,6 +48,7 @@ class RAGChatService:
             document_type=document_type,
             sensitivity_label=sensitivity_label,
             top_k=top_k,
+            scope=scope,
         )
 
         requested_provider_config = (
@@ -163,12 +167,14 @@ class RAGChatService:
         message,
         conversation_uuid=None,
         department_uuid=None,
+        scope=Document.Scope.INTERNAL,
     ):
         if conversation_uuid:
             return AIConversation.objects.get(
                 uuid=conversation_uuid,
                 company=user.company,
                 user=user,
+                scope=scope,
                 is_deleted=False,
             )
 
@@ -188,6 +194,7 @@ class RAGChatService:
         return AIConversation.objects.create(
             company=user.company,
             user=user,
+            scope=scope,
             department=department,
             title=title,
         )

@@ -1,0 +1,5 @@
+1. show real time process of document like github - frontend
+2. need to improve the backend for real time retry processing - backend
+2.1 each section should show real time progress of processing and error if occured - backend
+3. access and refresh token is expiring soon need to fix that - backend
+4. internal and external sections for documents - backend

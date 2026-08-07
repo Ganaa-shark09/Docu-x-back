@@ -29,3 +29,5 @@ requests==2.32.3
 python-magic==0.4.27
 cryptography==43.0.1
 openpyxl==3.1.5
+
+python-docx==1.1.2

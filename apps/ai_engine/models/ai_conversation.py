@@ -7,9 +7,20 @@ from apps.workspaces.models import Department
 
 
 class AIConversation(BaseModel):
+    class Scope(models.TextChoices):
+        INTERNAL = "internal", "Internal"
+        EXTERNAL = "external", "External"
+
     class Status(models.TextChoices):
         ACTIVE = "active", "Active"
         ARCHIVED = "archived", "Archived"
+
+    scope = models.CharField(
+        max_length=30,
+        choices=Scope.choices,
+        default=Scope.INTERNAL,
+        db_index=True,
+    )
 
     company = models.ForeignKey(
         Company,
@@ -47,6 +58,7 @@ class AIConversation(BaseModel):
     class Meta:
         ordering = ["-updated_at"]
         indexes = [
+            models.Index(fields=["company", "scope"]),
             models.Index(fields=["company", "user"]),
             models.Index(fields=["company", "department"]),
             models.Index(fields=["company", "status"]),

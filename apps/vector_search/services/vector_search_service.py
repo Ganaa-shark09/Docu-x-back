@@ -1,5 +1,6 @@
 from pgvector.django import CosineDistance
 
+from apps.documents.models import Document
 from apps.documents.services import DocumentPermissionService
 from apps.vector_search.models import DocumentChunk
 from apps.vector_search.services.embedding_provider import EmbeddingProviderFactory
@@ -17,6 +18,8 @@ class VectorSearchService:
         sensitivity_label=None,
         top_k=10,
         provider_name="local_hashing",
+        scope=Document.Scope.INTERNAL,
+        document_uuids=None,
     ):
         provider = EmbeddingProviderFactory.get_provider(provider_name)
         query_embedding = provider.embed_text(query)
@@ -27,6 +30,7 @@ class VectorSearchService:
                 is_deleted=False,
                 document__is_deleted=False,
                 document__is_ai_ready=True,
+                document__scope=scope,
             )
             .select_related("document", "department", "company")
             .annotate(distance=CosineDistance("embedding", query_embedding))
@@ -38,10 +42,14 @@ class VectorSearchService:
                     user=user,
                     required_access="view",
                     require_ai=True,
+                    scope=scope,
                 ).values_list("id", flat=True)
             )
 
             queryset = queryset.filter(document_id__in=allowed_document_ids)
+
+        if document_uuids:
+            queryset = queryset.filter(document__uuid__in=document_uuids)
 
         if department_uuid:
             queryset = queryset.filter(department__uuid=department_uuid)
@@ -65,6 +73,7 @@ class VectorSearchService:
                     "chunk_uuid": str(chunk.uuid),
                     "document_uuid": str(chunk.document.uuid),
                     "document_title": chunk.document.title,
+                    "document_scope": chunk.document.scope,
                     "department_uuid": str(chunk.department.uuid)
                     if chunk.department
                     else None,

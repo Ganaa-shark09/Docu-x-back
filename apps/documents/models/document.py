@@ -26,12 +26,24 @@ class Document(BaseModel):
         FAILED = "failed", "Failed"
         ARCHIVED = "archived", "Archived"
 
+    class Scope(models.TextChoices):
+        INTERNAL = "internal", "Internal"
+        EXTERNAL = "external", "External"
+
     class Sensitivity(models.TextChoices):
         PUBLIC = "public", "Public"
         INTERNAL = "internal", "Internal"
         CONFIDENTIAL = "confidential", "Confidential"
         HIGHLY_CONFIDENTIAL = "highly_confidential", "Highly Confidential"
         RESTRICTED = "restricted", "Restricted"
+
+    scope = models.CharField(
+        max_length=30,
+        choices=Scope.choices,
+        default=Scope.INTERNAL,
+        db_index=True,
+        help_text="Internal documents are company knowledge. External documents are user/chat uploads.",
+    )
 
     company = models.ForeignKey(
         Company,
@@ -100,6 +112,7 @@ class Document(BaseModel):
     class Meta:
         ordering = ["-created_at"]
         indexes = [
+            models.Index(fields=["company", "scope"]),
             models.Index(fields=["company", "status"]),
             models.Index(fields=["company", "document_type"]),
             models.Index(fields=["company", "sensitivity_label"]),

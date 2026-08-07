@@ -5,4 +5,6 @@ __all__ = [
     "AIConversationAdmin",
     "AIMessageAdmin",
     "LLMProviderConfigAdmin",
+    "AIConversationDocumentAdmin",
 ]
+from .ai_conversation_document_admin import AIConversationDocumentAdmin

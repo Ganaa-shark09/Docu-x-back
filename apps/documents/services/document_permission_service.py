@@ -46,7 +46,9 @@ class DocumentPermissionService:
 
     @classmethod
     def get_user_department_ids(
-        cls, user, required_access=DocumentAccessPolicy.AccessLevel.VIEW
+        cls,
+        user,
+        required_access=DocumentAccessPolicy.AccessLevel.VIEW,
     ):
         if (
             not user
@@ -79,6 +81,7 @@ class DocumentPermissionService:
         user,
         required_access=DocumentAccessPolicy.AccessLevel.VIEW,
         require_ai=False,
+        scope=None,
     ):
         if (
             not user
@@ -92,7 +95,25 @@ class DocumentPermissionService:
             is_deleted=False,
         )
 
-        if cls.is_company_admin(user):
+        if scope:
+            base_queryset = base_queryset.filter(scope=scope)
+
+        if require_ai:
+            base_queryset = base_queryset.filter(is_ai_ready=True)
+
+        # External documents are user-private by default.
+        if scope == Document.Scope.EXTERNAL:
+            if cls.is_company_admin(user):
+                return base_queryset
+
+            return base_queryset.filter(uploaded_by=user)
+
+        # Internal company documents follow department/document policy rules.
+        if scope == Document.Scope.INTERNAL and cls.is_company_admin(user):
+            return base_queryset
+
+        # If scope is not provided, company admins can see both internal and external.
+        if not scope and cls.is_company_admin(user):
             return base_queryset
 
         allowed_access_levels = cls.get_allowed_access_levels(required_access)
@@ -101,7 +122,7 @@ class DocumentPermissionService:
             required_access=required_access,
         )
 
-        access_query = (
+        internal_access_query = Q(scope=Document.Scope.INTERNAL) & (
             Q(uploaded_by=user)
             | Q(department_id__in=department_ids)
             | Q(
@@ -116,6 +137,8 @@ class DocumentPermissionService:
             )
         )
 
+        external_access_query = Q(scope=Document.Scope.EXTERNAL, uploaded_by=user)
+
         if require_ai:
             explicit_ai_query = Q(
                 access_policies__user=user,
@@ -129,13 +152,15 @@ class DocumentPermissionService:
                 access_policies__is_deleted=False,
             )
 
-            access_query = (
+            internal_access_query = Q(scope=Document.Scope.INTERNAL) & (
                 Q(uploaded_by=user)
                 | Q(department_id__in=department_ids)
                 | explicit_ai_query
             )
 
-        return base_queryset.filter(access_query).distinct()
+        return base_queryset.filter(
+            internal_access_query | external_access_query
+        ).distinct()
 
     @classmethod
     def has_document_access(
@@ -153,6 +178,7 @@ class DocumentPermissionService:
                 user=user,
                 required_access=required_access,
                 require_ai=require_ai,
+                scope=document.scope,
             )
             .filter(pk=document.pk)
             .exists()
@@ -164,6 +190,11 @@ class DocumentPermissionService:
             return DocumentAccessPolicy.AccessLevel.ADMIN
 
         if not user or not user.is_authenticated or not document:
+            return None
+
+        if document.scope == Document.Scope.EXTERNAL:
+            if document.uploaded_by_id == user.id:
+                return DocumentAccessPolicy.AccessLevel.ADMIN
             return None
 
         if document.uploaded_by_id == user.id:

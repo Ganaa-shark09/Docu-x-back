@@ -47,6 +47,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
             DocumentPermissionService.get_accessible_document_queryset(
                 user=user,
                 required_access="view",
+                scope=self.request.query_params.get("scope", Document.Scope.INTERNAL),
             )
             .select_related(
                 "company",

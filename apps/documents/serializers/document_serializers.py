@@ -1,4 +1,3 @@
-from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
 from apps.data_firewall.models import FirewallScan
@@ -14,6 +13,7 @@ from apps.documents.services import (
     DocumentPermissionService,
     DocumentProcessingJobService,
 )
+from apps.workspaces.models import Department
 
 
 class DocumentProcessingJobSerializer(serializers.ModelSerializer):
@@ -256,12 +256,11 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
 
 
 class DocumentCreateSerializer(serializers.ModelSerializer):
-    file = serializers.FileField(write_only=True)
+    department = serializers.UUIDField(required=False, allow_null=True)
 
     class Meta:
         model = Document
         fields = [
-            "uuid",
             "title",
             "description",
             "department",
@@ -269,40 +268,44 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
             "sensitivity_label",
             "file",
         ]
-        read_only_fields = ["uuid"]
 
-    def validate_department(self, department):
-        request = self.context["request"]
+    def validate_department(self, department_uuid):
+        request = self.context.get("request")
 
-        if department and department.company_id != request.user.company_id:
-            raise serializers.ValidationError(
-                "Selected department does not belong to your company."
-            )
+        if not department_uuid:
+            return None
+
+        department = Department.objects.filter(
+            uuid=department_uuid,
+            company=request.user.company,
+            is_deleted=False,
+        ).first()
+
+        if not department:
+            raise serializers.ValidationError("Department not found for your company.")
 
         return department
 
     def validate_file(self, uploaded_file):
-        try:
-            DocumentFileValidationService.validate_file(uploaded_file)
-        except DjangoValidationError as exc:
-            raise serializers.ValidationError(exc.messages)
-
+        DocumentFileValidationService.validate_file(uploaded_file)
         return uploaded_file
 
     def create(self, validated_data):
         request = self.context["request"]
         uploaded_file = validated_data["file"]
+        department = validated_data.pop("department", None)
 
         checksum = DocumentFileValidationService.calculate_checksum(uploaded_file)
 
         document = Document.objects.create(
             company=request.user.company,
+            scope=Document.Scope.INTERNAL,
+            department=department,
             uploaded_by=request.user,
             original_filename=uploaded_file.name,
             file_size=uploaded_file.size,
             mime_type=getattr(uploaded_file, "content_type", ""),
             checksum=checksum,
-            status=Document.Status.UPLOADED,
             **validated_data,
         )
 

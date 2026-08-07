@@ -2,6 +2,8 @@ from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.documents.models import Document
+
 from apps.vector_search.serializers import (
     VectorSearchRequestSerializer,
     VectorSearchResultSerializer,
@@ -30,6 +32,7 @@ class VectorSearchAPIView(APIView):
             document_type=serializer.validated_data.get("document_type"),
             sensitivity_label=serializer.validated_data.get("sensitivity_label"),
             top_k=serializer.validated_data.get("top_k", 10),
+            scope=Document.Scope.INTERNAL,
         )
 
         response_serializer = VectorSearchResultSerializer(results, many=True)

@@ -71,15 +71,25 @@ class AIConversationListAPIView(generics.ListAPIView):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return (
-            AIConversation.objects.filter(
-                company=self.request.user.company,
-                user=self.request.user,
-                is_deleted=False,
-            )
-            .select_related("department", "company", "user")
-            .order_by("-updated_at")
+        user = self.request.user
+
+        scope = self.request.query_params.get(
+            "scope",
+            AIConversation.Scope.INTERNAL,
         )
+
+        if scope not in [
+            AIConversation.Scope.INTERNAL,
+            AIConversation.Scope.EXTERNAL,
+        ]:
+            scope = AIConversation.Scope.INTERNAL
+
+        return AIConversation.objects.filter(
+            company=user.company,
+            user=user,
+            scope=scope,
+            is_deleted=False,
+        ).order_by("-updated_at")
 
 
 class AIConversationDetailAPIView(generics.RetrieveAPIView):

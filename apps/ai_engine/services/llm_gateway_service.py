@@ -41,7 +41,14 @@ class LocalFallbackLLMProvider:
     }
 
     @classmethod
-    def generate_answer(cls, question, retrieved_chunks, prompt=None, config=None):
+    def generate_answer(
+        cls,
+        question,
+        retrieved_chunks,
+        prompt=None,
+        config=None,
+        allow_general_answer=False,
+    ):
         if not retrieved_chunks:
             return {
                 "answer": "I could not find relevant information in the indexed company documents.",
@@ -123,7 +130,14 @@ class OllamaLLMProvider:
     provider_name = "ollama"
 
     @classmethod
-    def generate_answer(cls, question, retrieved_chunks, prompt=None, config=None):
+    def generate_answer(
+        cls,
+        question,
+        retrieved_chunks,
+        prompt=None,
+        config=None,
+        allow_general_answer=False,
+    ):
         endpoint = (
             (config.endpoint_url or "http://ollama:11434").rstrip("/")
             if config
@@ -133,7 +147,7 @@ class OllamaLLMProvider:
         temperature = float(config.temperature) if config else 0.2
         max_tokens = config.max_tokens if config else 1200
 
-        if not retrieved_chunks:
+        if not retrieved_chunks and not allow_general_answer:
             return LocalFallbackLLMProvider.generate_answer(
                 question=question,
                 retrieved_chunks=retrieved_chunks,
@@ -214,7 +228,14 @@ class OpenAILLMProvider:
     provider_name = "openai"
 
     @classmethod
-    def generate_answer(cls, question, retrieved_chunks, prompt=None, config=None):
+    def generate_answer(
+        cls,
+        question,
+        retrieved_chunks,
+        prompt=None,
+        config=None,
+        allow_general_answer=False,
+    ):
         api_key = config.get_api_key() if config else ""
 
         if not api_key:
@@ -387,6 +408,7 @@ class LLMGatewayService:
         retrieved_chunks,
         prompt=None,
         provider_config=None,
+        allow_general_answer=False,
     ):
         if not provider_config:
             return LocalFallbackLLMProvider.generate_answer(
@@ -401,6 +423,7 @@ class LLMGatewayService:
                 retrieved_chunks=retrieved_chunks,
                 prompt=prompt,
                 config=provider_config,
+                allow_general_answer=allow_general_answer,
             )
 
         if provider_config.provider_type == LLMProviderConfig.ProviderType.OPENAI:

@@ -6,4 +6,7 @@ __all__ = [
     "AIConversation",
     "AIMessage",
     "LLMProviderConfig",
+    "AIConversationDocument",
 ]
+
+from .ai_conversation_document import AIConversationDocument
