@@ -5,7 +5,14 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.ai_engine.models import AIConversation
 from apps.ai_engine.services import ExternalChatService
+from apps.ai_engine.services.external_document_readiness_service import (
+    ExternalDocumentReadinessService,
+)
+from apps.ai_engine.services.external_semantic_orchestrator_service import (
+    ExternalSemanticOrchestratorService,
+)
 from apps.documents.models import Document
 from apps.documents.serializers.external_document_serializers import (
     ExternalDocumentSerializer,
@@ -34,16 +41,122 @@ class ExternalChatAPIView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        conversation_uuid = request.data.get("conversation_uuid") or None
+        document_uuids = ExternalDocumentReadinessService.normalize_uuids(
+            request.data.get("document_uuids")
+        )
+        document_uuids = document_uuids or None
+        use_web_value = request.data.get("use_web", True)
+        use_web = (
+            use_web_value
+            if isinstance(use_web_value, bool)
+            else str(use_web_value).strip().lower() in {"true", "1", "yes"}
+        )
+
+        routing_plan = None
+        document_descriptors = []
+        document_scope_mode = "none"
+
+        # The frontend may send either the specifically selected documents or all
+        # documents currently attached to the conversation. Document readiness
+        # must therefore not block an unrelated general query. We always validate
+        # ownership/conversation membership first, but only gate on processing or
+        # failure when semantic routing says the request actually requires document
+        # content. The WebSocket normally prevents this race; this remains the
+        # authoritative backend safety net.
+        if document_uuids:
+            readiness = ExternalDocumentReadinessService.inspect(
+                user=request.user,
+                document_uuids=document_uuids,
+                conversation_uuid=conversation_uuid,
+            )
+            document_descriptors = readiness["documents"]
+            document_scope_mode = readiness.get("document_scope_mode", "selected")
+
+            if readiness["missing_document_uuids"]:
+                return Response(
+                    {
+                        "status": "attachments_invalid",
+                        "detail": "One or more attached files are unavailable for this conversation.",
+                        **readiness,
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if readiness["has_processing"] or readiness["has_failed"]:
+                conversation = None
+                if conversation_uuid:
+                    conversation = AIConversation.objects.filter(
+                        uuid=conversation_uuid,
+                        company=request.user.company,
+                        user=request.user,
+                        scope=AIConversation.Scope.EXTERNAL,
+                        is_deleted=False,
+                    ).first()
+
+                routing_plan = ExternalSemanticOrchestratorService.plan_resilient(
+                    message=message,
+                    conversation=conversation,
+                    has_attached_documents=bool(document_uuids),
+                    has_explicit_documents=(document_scope_mode == "selected"),
+                    use_web=use_web,
+                    document_descriptors=document_descriptors,
+                    document_scope_mode=document_scope_mode,
+                )
+
+                requires_documents = (
+                    routing_plan.get("document_dependency")
+                    == ExternalSemanticOrchestratorService.DOCUMENT_DEPENDENCY_REQUIRED
+                    or routing_plan.get("action")
+                    in {
+                        ExternalSemanticOrchestratorService.ACTION_DOCUMENT,
+                        ExternalSemanticOrchestratorService.ACTION_DOCUMENT_WEB,
+                    }
+                )
+
+                if requires_documents and readiness["has_failed"]:
+                    return Response(
+                        {
+                            "status": "attachment_processing_failed",
+                            "detail": "One or more documents required for this query failed processing.",
+                            "failed_document_uuids": [
+                                item["uuid"] for item in readiness["failed_documents"]
+                            ],
+                            **readiness,
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
+
+                if requires_documents and (
+                    readiness["has_processing"] or not readiness["all_ready"]
+                ):
+                    return Response(
+                        {
+                            "status": "attachments_processing",
+                            "detail": "The documents required for this query are still being processed.",
+                            "wait_for_document_uuids": [
+                                item["uuid"]
+                                for item in readiness["processing_documents"]
+                            ],
+                            **readiness,
+                        },
+                        status=status.HTTP_202_ACCEPTED,
+                    )
+
         result = ExternalChatService.chat(
             user=request.user,
             message=message,
-            conversation_uuid=request.data.get("conversation_uuid"),
+            conversation_uuid=conversation_uuid,
             top_k=int(request.data.get("top_k", 8)),
-            use_web=bool(request.data.get("use_web", True)),
-            document_uuids=request.data.get("document_uuids") or None,
+            use_web=use_web,
+            document_uuids=document_uuids,
+            routing_plan=routing_plan,
+            document_descriptors=document_descriptors,
+            document_scope_mode=document_scope_mode,
         )
 
         assistant_message = result["assistant_message"]
+        routing_context = (result["user_message"].metadata or {}).get("routing", {})
 
         return Response(
             {
@@ -60,6 +173,9 @@ class ExternalChatAPIView(APIView):
                 },
                 "external_context": {
                     "intent": result.get("intent"),
+                    "requested_document_uuids": document_uuids or [],
+                    "document_scope_mode": document_scope_mode,
+                    "routing": routing_context,
                     "external_chunk_count": len(result["external_chunks"]),
                     "web_result_count": len(result["web_results"]),
                     "processing_documents": result.get("processing_documents", []),
@@ -200,6 +316,30 @@ class ExternalDocumentViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_201_CREATED,
         )
+
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="processing-status",
+    )
+    def processing_status(self, request):
+        document_uuids = request.query_params.getlist("document_uuid")
+        if not document_uuids:
+            document_uuids = request.query_params.get("document_uuids") or ""
+
+        normalized = ExternalDocumentReadinessService.normalize_uuids(document_uuids)
+        if not normalized:
+            return Response(
+                {"detail": "At least one document UUID is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = ExternalDocumentReadinessService.inspect(
+            user=request.user,
+            document_uuids=normalized,
+            conversation_uuid=request.query_params.get("conversation_uuid") or None,
+        )
+        return Response(result, status=status.HTTP_200_OK)
 
     def perform_destroy(self, instance):
         instance.soft_delete()

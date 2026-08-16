@@ -31,3 +31,5 @@ cryptography==43.0.1
 openpyxl==3.1.5
 
 python-docx==1.1.2
+channels[daphne]==4.3.2
+channels-redis==4.3.0

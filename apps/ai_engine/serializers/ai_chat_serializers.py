@@ -61,14 +61,64 @@ class AIConversationDetailSerializer(serializers.ModelSerializer):
 
 
 class AIChatRequestSerializer(serializers.Serializer):
+    DOCUMENT_SCOPE_ALL = "all"
+    DOCUMENT_SCOPE_SELECTED = "selected"
+
     message = serializers.CharField()
     conversation_uuid = serializers.UUIDField(required=False)
     department = serializers.UUIDField(required=False)
     document_type = serializers.CharField(required=False)
     sensitivity_label = serializers.CharField(required=False)
+    document_scope = serializers.ChoiceField(
+        choices=[DOCUMENT_SCOPE_ALL, DOCUMENT_SCOPE_SELECTED],
+        required=False,
+        default=DOCUMENT_SCOPE_ALL,
+    )
+    document_uuids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        max_length=50,
+        default=list,
+    )
     top_k = serializers.IntegerField(
         required=False, min_value=1, max_value=20, default=5
     )
+
+    def validate(self, attrs):
+        document_uuids = attrs.get("document_uuids", [])
+
+        # Preserve order while preventing duplicate document filters.
+        deduplicated = list(dict.fromkeys(document_uuids))
+        attrs["document_uuids"] = deduplicated
+
+        # Ergonomic/backward-compatible behavior: if UUIDs are supplied and the
+        # client omitted document_scope, infer an explicitly selected scope.
+        if deduplicated and "document_scope" not in self.initial_data:
+            attrs["document_scope"] = self.DOCUMENT_SCOPE_SELECTED
+
+        document_scope = attrs.get("document_scope", self.DOCUMENT_SCOPE_ALL)
+
+        if document_scope == self.DOCUMENT_SCOPE_SELECTED and not deduplicated:
+            raise serializers.ValidationError(
+                {
+                    "document_uuids": (
+                        "At least one document UUID is required when "
+                        "document_scope is 'selected'."
+                    )
+                }
+            )
+
+        if document_scope == self.DOCUMENT_SCOPE_ALL and deduplicated:
+            raise serializers.ValidationError(
+                {
+                    "document_uuids": (
+                        "document_uuids must be empty when document_scope is 'all'."
+                    )
+                }
+            )
+
+        return attrs
 
 
 class AIChatResponseSerializer(serializers.Serializer):
@@ -76,6 +126,7 @@ class AIChatResponseSerializer(serializers.Serializer):
     message_uuid = serializers.UUIDField()
     answer = serializers.CharField()
     sources = serializers.ListField()
+    document_context = serializers.DictField()
     model_provider = serializers.CharField()
     model_name = serializers.CharField()
     usage = serializers.DictField()

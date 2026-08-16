@@ -1,0 +1,279 @@
+diff --git a/apps/ai_engine/services/external_semantic_orchestrator_service.py b/apps/ai_engine/services/external_semantic_orchestrator_service.py
+index 0d11c0c..7baccd9 100644
+--- a/apps/ai_engine/services/external_semantic_orchestrator_service.py
++++ b/apps/ai_engine/services/external_semantic_orchestrator_service.py
+@@ -17,6 +17,16 @@ class ExternalSemanticOrchestratorService:
+     ACTION_DOCUMENT_WEB = "document_web"
+     ACTION_CLARIFY = "clarify"
+
++    DOCUMENT_DEPENDENCY_NONE = "none"
++    DOCUMENT_DEPENDENCY_REQUIRED = "required"
++    DOCUMENT_DEPENDENCY_OPTIONAL = "optional"
++
++    VALID_DOCUMENT_DEPENDENCIES = {
++        DOCUMENT_DEPENDENCY_NONE,
++        DOCUMENT_DEPENDENCY_REQUIRED,
++        DOCUMENT_DEPENDENCY_OPTIONAL,
++    }
++
+     VALID_ACTIONS = {
+         ACTION_DIRECT,
+         ACTION_DOCUMENT,
+@@ -66,6 +76,14 @@ class ExternalSemanticOrchestratorService:
+                 "type": "string",
+                 "enum": ["none", "qa", "extract", "summarize", "analyze"],
+             },
++            "document_dependency": {
++                "type": "string",
++                "enum": [
++                    DOCUMENT_DEPENDENCY_NONE,
++                    DOCUMENT_DEPENDENCY_REQUIRED,
++                    DOCUMENT_DEPENDENCY_OPTIONAL,
++                ],
++            },
+             "answer_tier": {
+                 "type": "string",
+                 "enum": ["fast", "quality"],
+@@ -97,6 +115,7 @@ class ExternalSemanticOrchestratorService:
+             "document_query",
+             "web_query",
+             "document_task",
++            "document_dependency",
+             "answer_tier",
+             "task_domain",
+             "reasoning_mode",
+@@ -211,11 +230,13 @@ class ExternalSemanticOrchestratorService:
+
+             logger.info(
+                 "external_ai_orchestrator_complete model=%s action=%s answer_tier=%s "
+-                "task_domain=%s answer_profile=%s reasoning_mode=%s quality_focus=%s "
+-                "fast_answer=%s wall_ms=%s prompt_tokens=%s completion_tokens=%s",
++                "document_dependency=%s task_domain=%s answer_profile=%s "
++                "reasoning_mode=%s quality_focus=%s fast_answer=%s wall_ms=%s "
++                "prompt_tokens=%s completion_tokens=%s",
+                 model,
+                 normalized["action"],
+                 normalized.get("answer_tier"),
++                normalized.get("document_dependency"),
+                 normalized.get("task_domain"),
+                 normalized.get("answer_profile"),
+                 normalized.get("reasoning_mode"),
+@@ -273,6 +294,7 @@ class ExternalSemanticOrchestratorService:
+                 "document_query": "",
+                 "web_query": "",
+                 "document_task": "none",
++                "document_dependency": cls.DOCUMENT_DEPENDENCY_NONE,
+                 "answer_tier": "fast",
+                 "task_domain": "general",
+                 "answer_profile": "general",
+@@ -308,6 +330,9 @@ class ExternalSemanticOrchestratorService:
+         document_query = (result.get("document_query") or "").strip()
+         web_query = (result.get("web_query") or "").strip()
+         document_task = (result.get("document_task") or "none").strip().lower()
++        document_dependency = (
++            result.get("document_dependency") or cls.DOCUMENT_DEPENDENCY_NONE
++        ).strip().lower()
+         answer_tier = (result.get("answer_tier") or "quality").strip().lower()
+         reasoning_mode = (result.get("reasoning_mode") or "standard").strip().lower()
+
+@@ -347,6 +372,8 @@ class ExternalSemanticOrchestratorService:
+             action = cls.ACTION_DIRECT
+         if document_task not in valid_document_tasks:
+             document_task = "qa"
++        if document_dependency not in cls.VALID_DOCUMENT_DEPENDENCIES:
++            document_dependency = cls.DOCUMENT_DEPENDENCY_NONE
+         if answer_tier not in {"fast", "quality"}:
+             answer_tier = "quality"
+         if reasoning_mode not in {"none", "standard", "deep"}:
+@@ -354,6 +381,29 @@ class ExternalSemanticOrchestratorService:
+
+         documents_available = bool(has_attached_documents or has_explicit_documents)
+
++        # Document dependency is independent from action. The routing model does
++        # not need file contents itself; it only decides whether the downstream
++        # document tool is required. This prevents an attachment-aware request
++        # from becoming a false clarification merely because the router cannot
++        # inspect the attachment directly.
++        if document_dependency == cls.DOCUMENT_DEPENDENCY_REQUIRED:
++            if not documents_available:
++                return cls._non_direct_plan(
++                    action=cls.ACTION_CLARIFY,
++                    clarification=(
++                        "Please attach or select the document you want me to use."
++                    ),
++                    document_dependency=cls.DOCUMENT_DEPENDENCY_REQUIRED,
++                )
++
++            if action in {cls.ACTION_DIRECT, cls.ACTION_CLARIFY}:
++                action = cls.ACTION_DOCUMENT
++            elif action == cls.ACTION_WEB:
++                action = cls.ACTION_DOCUMENT_WEB if use_web else cls.ACTION_DOCUMENT
++
++            if document_task == "none":
++                document_task = "qa"
++
+         if (
+             action in {cls.ACTION_DOCUMENT, cls.ACTION_DOCUMENT_WEB}
+             and not documents_available
+@@ -385,7 +435,10 @@ class ExternalSemanticOrchestratorService:
+             document_task = "qa"
+
+         if action != cls.ACTION_DIRECT:
+-            plan = cls._non_direct_plan(action=action)
++            plan = cls._non_direct_plan(
++                action=action,
++                document_dependency=document_dependency,
++            )
+             plan["document_query"] = document_query
+             plan["web_query"] = web_query
+             plan["document_task"] = document_task
+@@ -425,6 +478,7 @@ class ExternalSemanticOrchestratorService:
+             "document_query": document_query,
+             "web_query": web_query,
+             "document_task": document_task,
++            "document_dependency": document_dependency,
+             "answer_tier": answer_tier,
+             "task_domain": task_domain,
+             "answer_profile": answer_profile,
+@@ -493,7 +547,11 @@ class ExternalSemanticOrchestratorService:
+         return requirements[:8]
+
+     @staticmethod
+-    def _non_direct_plan(action, clarification=""):
++    def _non_direct_plan(
++        action,
++        clarification="",
++        document_dependency="none",
++    ):
+         return {
+             "action": action,
+             "clarification": clarification,
+@@ -501,6 +559,7 @@ class ExternalSemanticOrchestratorService:
+             "document_query": "",
+             "web_query": "",
+             "document_task": "none",
++            "document_dependency": document_dependency,
+             "answer_tier": "fast",
+             "task_domain": "general",
+             "answer_profile": "general",
+@@ -526,6 +585,17 @@ Action:
+ - document_web: both document content and current web evidence are required.
+ - clarify: essential information is missing.
+
++Choose document_dependency independently from action:
++- required: answering correctly requires content from an attached/selected document.
++- optional: document content may help, but the request can still be answered correctly without it.
++- none: attached/selected document content is not needed.
++
++The router does NOT need to inspect document contents itself. When documents=true,
++the downstream document tool can access them after routing. Therefore, when the
++user's request depends on an attached/selected file, set document_dependency=required
++and route to document (or document_web when current web evidence is also required).
++Never use clarify only because the routing model cannot see or access the attachment.
++
+ For direct requests choose answer_tier:
+ - fast: short, low-complexity requests that can be answered completely in a compact response.
+ - quality: coding, detailed/long-form work, nuanced analysis, correctness-sensitive work,
+@@ -557,6 +627,8 @@ Rules:
+   fast_answer="".
+ - direct + general quality: fast_answer=""; use standard or deep as appropriate.
+ - non-direct: fast_answer="", task_domain=general, reasoning_mode=none, quality_focus=[].
++- document/document_web: document_dependency=required.
++- clarify for a missing required document is valid only when documents=false.
+ - clarification is populated only for clarify.
+ - Web being enabled does not mean web is required. Attached files do not mean they are relevant.
+ - Never invent document or web content.
+diff --git a/apps/ai_engine/tests/test_external_semantic_orchestrator_service.py b/apps/ai_engine/tests/test_external_semantic_orchestrator_service.py
+index b686bd2..386f5f3 100644
+--- a/apps/ai_engine/tests/test_external_semantic_orchestrator_service.py
++++ b/apps/ai_engine/tests/test_external_semantic_orchestrator_service.py
+@@ -313,3 +313,89 @@ class ExternalSemanticOrchestratorOrthogonalRoutingTests(SimpleTestCase):
+         self.assertEqual(result["reasoning_mode"], "deep")
+         self.assertEqual(result["quality_focus"], [])
+         self.assertEqual(result["quality_requirements"], [])
++
++
++class ExternalSemanticOrchestratorDocumentDependencyTests(SimpleTestCase):
++    def test_required_document_dependency_recovers_clarify_when_attachment_exists(self):
++        result = ExternalSemanticOrchestratorService._normalize(
++            {
++                "action": "clarify",
++                "clarification": "I cannot inspect the attachment.",
++                "fast_answer": "",
++                "document_query": "",
++                "web_query": "",
++                "document_task": "none",
++                "document_dependency": "required",
++                "answer_tier": "fast",
++                "task_domain": "general",
++                "reasoning_mode": "none",
++                "quality_focus": [],
++            },
++            has_attached_documents=True,
++            has_explicit_documents=False,
++            use_web=True,
++        )
++
++        self.assertEqual(result["action"], "document")
++        self.assertEqual(result["document_dependency"], "required")
++        self.assertEqual(result["document_task"], "qa")
++        self.assertEqual(result["clarification"], "")
++
++    def test_required_document_dependency_without_document_clarifies(self):
++        result = ExternalSemanticOrchestratorService._normalize(
++            {
++                "action": "direct",
++                "clarification": "",
++                "fast_answer": "",
++                "document_query": "",
++                "web_query": "",
++                "document_task": "qa",
++                "document_dependency": "required",
++                "answer_tier": "quality",
++                "task_domain": "general",
++                "reasoning_mode": "standard",
++                "quality_focus": [],
++            },
++            has_attached_documents=False,
++            has_explicit_documents=False,
++            use_web=True,
++        )
++
++        self.assertEqual(result["action"], "clarify")
++        self.assertEqual(result["document_dependency"], "required")
++        self.assertTrue(result["clarification"])
++
++    def test_optional_document_dependency_does_not_force_document_route(self):
++        result = ExternalSemanticOrchestratorService._normalize(
++            {
++                "action": "direct",
++                "clarification": "",
++                "fast_answer": "Hello.",
++                "document_query": "",
++                "web_query": "",
++                "document_task": "none",
++                "document_dependency": "optional",
++                "answer_tier": "fast",
++                "task_domain": "general",
++                "reasoning_mode": "none",
++                "quality_focus": [],
++            },
++            has_attached_documents=True,
++            has_explicit_documents=False,
++            use_web=True,
++        )
++
++        self.assertEqual(result["action"], "direct")
++        self.assertEqual(result["document_dependency"], "optional")
++        self.assertEqual(result["fast_answer"], "Hello.")
++
++    def test_prompt_explains_attachment_routing_contract(self):
++        prompt = ExternalSemanticOrchestratorService._build_system_prompt(
++            has_attached_documents=True,
++            has_explicit_documents=False,
++            use_web=True,
++        )
++
++        self.assertIn("document_dependency", prompt)
++        self.assertIn("downstream document tool can access them", prompt)
++        self.assertIn("Never use clarify only", prompt)

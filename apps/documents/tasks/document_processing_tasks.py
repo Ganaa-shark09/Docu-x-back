@@ -7,6 +7,7 @@ from apps.document_processing.services import (
     TextExtractionService,
 )
 from apps.documents.models import Document, DocumentProcessingJob
+from apps.documents.services import DocumentProcessingEventService
 from apps.vector_search.services import VectorIndexingService
 
 
@@ -28,12 +29,14 @@ def _mark_job_running(document, job_type):
 
     job.status = DocumentProcessingJob.Status.RUNNING
     job.started_at = timezone.now()
+    job.completed_at = None
     job.error_message = ""
     job.progress_percent = 10
     job.save(
         update_fields=[
             "status",
             "started_at",
+            "completed_at",
             "error_message",
             "progress_percent",
             "updated_at",
@@ -44,6 +47,9 @@ def _mark_job_running(document, job_type):
 
 
 def _mark_job_success(job, output_payload=None):
+    if not job or job.status == DocumentProcessingJob.Status.SUCCESS:
+        return
+
     job.status = DocumentProcessingJob.Status.SUCCESS
     job.completed_at = timezone.now()
     job.progress_percent = 100
@@ -60,6 +66,9 @@ def _mark_job_success(job, output_payload=None):
 
 
 def _mark_job_failed(job, error):
+    if not job:
+        return
+
     job.status = DocumentProcessingJob.Status.FAILED
     job.completed_at = timezone.now()
     job.progress_percent = 100
@@ -79,9 +88,15 @@ def _mark_job_failed(job, error):
 def process_document_pipeline(self, document_uuid):
     document = Document.objects.get(uuid=document_uuid)
 
-    document.status = Document.Status.PROCESSING
+    document.is_ai_ready = False
     document.processing_error = ""
-    document.save(update_fields=["status", "processing_error", "updated_at"])
+    document.save(
+        update_fields=[
+            "is_ai_ready",
+            "processing_error",
+            "updated_at",
+        ]
+    )
 
     try:
         extraction_result = run_text_extraction(document.uuid)
@@ -92,23 +107,39 @@ def process_document_pipeline(self, document_uuid):
         document.refresh_from_db()
 
         document.is_ai_ready = bool(document.is_ocr_completed and document.is_indexed)
-        document.status = (
-            Document.Status.READY if document.is_ai_ready else Document.Status.FAILED
-        )
 
         if not document.is_ai_ready:
             document.processing_error = (
                 "Document processing completed, but document is not AI ready."
             )
-
-        document.save(
-            update_fields=[
-                "is_ai_ready",
-                "status",
-                "processing_error",
-                "updated_at",
-            ]
-        )
+            document.save(
+                update_fields=[
+                    "is_ai_ready",
+                    "processing_error",
+                    "updated_at",
+                ]
+            )
+            DocumentProcessingEventService.transition(
+                document,
+                stage=Document.ProcessingStage.FAILED,
+                error=document.processing_error,
+                message="Document processing completed but the document is not AI ready",
+            )
+        else:
+            document.processing_error = ""
+            document.save(
+                update_fields=[
+                    "is_ai_ready",
+                    "processing_error",
+                    "updated_at",
+                ]
+            )
+            DocumentProcessingEventService.transition(
+                document,
+                stage=Document.ProcessingStage.READY,
+                progress=100,
+                message="Document is ready for AI",
+            )
 
         return {
             "document_uuid": str(document.uuid),
@@ -117,17 +148,46 @@ def process_document_pipeline(self, document_uuid):
             "firewall": firewall_result,
             "indexing": indexing_result,
             "status": document.status,
+            "processing_stage": document.processing_stage,
         }
 
     except Exception as exc:
-        document.status = Document.Status.FAILED
-        document.processing_error = str(exc)
-        document.save(update_fields=["status", "processing_error", "updated_at"])
-        raise self.retry(exc=exc, countdown=10)
+        document.refresh_from_db()
+
+        if self.request.retries < self.max_retries:
+            retry_number = self.request.retries + 1
+            DocumentProcessingEventService.transition(
+                document,
+                stage=Document.ProcessingStage.QUEUED,
+                progress=0,
+                status=Document.Status.PROCESSING,
+                message=f"Retrying document processing ({retry_number}/{self.max_retries})",
+                error=None,
+                extra={
+                    "retry_number": retry_number,
+                    "max_retries": self.max_retries,
+                    "last_error": str(exc),
+                },
+            )
+            raise self.retry(exc=exc, countdown=10)
+
+        DocumentProcessingEventService.transition(
+            document,
+            stage=Document.ProcessingStage.FAILED,
+            error=exc,
+            message="Document processing failed",
+        )
+        raise
 
 
 def run_text_extraction(document_uuid):
     document = Document.objects.get(uuid=document_uuid)
+    DocumentProcessingEventService.transition(
+        document,
+        stage=Document.ProcessingStage.EXTRACTING,
+        progress=10,
+        message="Extracting document text",
+    )
 
     job = _mark_job_running(document, DocumentProcessingJob.JobType.OCR)
 
@@ -153,6 +213,12 @@ def run_text_extraction(document_uuid):
 
 def run_document_classification(document_uuid):
     document = Document.objects.get(uuid=document_uuid)
+    DocumentProcessingEventService.transition(
+        document,
+        stage=Document.ProcessingStage.CLASSIFYING,
+        progress=35,
+        message="Classifying document",
+    )
 
     job = _mark_job_running(document, DocumentProcessingJob.JobType.CLASSIFICATION)
 
@@ -168,6 +234,12 @@ def run_document_classification(document_uuid):
 
 def run_firewall_scan(document_uuid):
     document = Document.objects.get(uuid=document_uuid)
+    DocumentProcessingEventService.transition(
+        document,
+        stage=Document.ProcessingStage.FIREWALL_SCAN,
+        progress=45,
+        message="Running data firewall checks",
+    )
 
     job = _mark_job_running(document, DocumentProcessingJob.JobType.FIREWALL_SCAN)
 
@@ -194,32 +266,108 @@ def run_firewall_scan(document_uuid):
 def run_vector_indexing(document_uuid):
     document = Document.objects.get(uuid=document_uuid)
 
-    chunking_job = _mark_job_running(document, DocumentProcessingJob.JobType.CHUNKING)
-    embedding_job = _mark_job_running(document, DocumentProcessingJob.JobType.EMBEDDING)
-    indexing_job = _mark_job_running(document, DocumentProcessingJob.JobType.INDEXING)
+    jobs = {
+        "chunking": _mark_job_running(
+            document,
+            DocumentProcessingJob.JobType.CHUNKING,
+        ),
+        "embedding": None,
+        "indexing": None,
+    }
+    stage_metadata = {}
+
+    DocumentProcessingEventService.transition(
+        document,
+        stage=Document.ProcessingStage.CHUNKING,
+        progress=55,
+        message="Creating document chunks",
+    )
+
+    def progress_callback(stage, metadata):
+        nonlocal jobs, stage_metadata
+        metadata = metadata or {}
+        stage_metadata[stage] = metadata
+
+        if stage == "chunking":
+            # The CHUNKING stage was emitted immediately before indexing work
+            # started. Keep the computed chunk count for job output without
+            # sending a duplicate stage event.
+            return
+
+        if stage == "embedding":
+            _mark_job_success(
+                jobs["chunking"],
+                stage_metadata.get("chunking", {}),
+            )
+            jobs["embedding"] = jobs["embedding"] or _mark_job_running(
+                document,
+                DocumentProcessingJob.JobType.EMBEDDING,
+            )
+            DocumentProcessingEventService.transition(
+                document,
+                stage=Document.ProcessingStage.EMBEDDING,
+                progress=70,
+                message="Creating embeddings",
+                extra=metadata,
+            )
+            return
+
+        if stage == "indexing":
+            _mark_job_success(
+                jobs["embedding"],
+                stage_metadata.get("embedding", {}),
+            )
+            jobs["indexing"] = jobs["indexing"] or _mark_job_running(
+                document,
+                DocumentProcessingJob.JobType.INDEXING,
+            )
+            DocumentProcessingEventService.transition(
+                document,
+                stage=Document.ProcessingStage.INDEXING,
+                progress=90,
+                message="Indexing document",
+                extra=metadata,
+            )
 
     try:
-        result = VectorIndexingService.index_document(document)
-
-        _mark_job_success(
-            chunking_job,
-            {
-                "chunk_count": result.get("chunk_count", 0),
-            },
+        result = VectorIndexingService.index_document(
+            document,
+            progress_callback=progress_callback,
         )
+
+        # Handle providers/edge cases that return before one of the normal
+        # callbacks so processing-job state still reaches a terminal state.
         _mark_job_success(
-            embedding_job,
+            jobs["chunking"],
+            stage_metadata.get(
+                "chunking", {"chunk_count": result.get("chunk_count", 0)}
+            ),
+        )
+
+        if jobs["embedding"] is None:
+            jobs["embedding"] = _mark_job_running(
+                document,
+                DocumentProcessingJob.JobType.EMBEDDING,
+            )
+        _mark_job_success(
+            jobs["embedding"],
             {
                 "embedding_provider": result.get("embedding_provider"),
                 "embedding_dimensions": result.get("embedding_dimensions"),
             },
         )
-        _mark_job_success(indexing_job, result)
+
+        if jobs["indexing"] is None:
+            jobs["indexing"] = _mark_job_running(
+                document,
+                DocumentProcessingJob.JobType.INDEXING,
+            )
+        _mark_job_success(jobs["indexing"], result)
 
         return result
 
     except Exception as exc:
-        _mark_job_failed(chunking_job, exc)
-        _mark_job_failed(embedding_job, exc)
-        _mark_job_failed(indexing_job, exc)
+        _mark_job_failed(jobs.get("chunking"), exc)
+        _mark_job_failed(jobs.get("embedding"), exc)
+        _mark_job_failed(jobs.get("indexing"), exc)
         raise

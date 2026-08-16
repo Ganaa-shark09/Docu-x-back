@@ -1,8 +1,13 @@
+import logging
+import os
 import re
+import time
 
 import requests
 
 from apps.ai_engine.models import LLMProviderConfig
+
+logger = logging.getLogger(__name__)
 
 
 class LocalFallbackLLMProvider:
@@ -48,16 +53,47 @@ class LocalFallbackLLMProvider:
         prompt=None,
         config=None,
         allow_general_answer=False,
+        allow_extractive_fallback=True,
     ):
         if not retrieved_chunks:
+            if allow_general_answer:
+                return {
+                    "answer": (
+                        "I couldn't complete the AI request right now. Please try again."
+                    ),
+                    "provider": cls.provider_name,
+                    "model": cls.model_name,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "metadata": {"fallback_reason": "general_generation_unavailable"},
+                }
+
             return {
-                "answer": "I could not find relevant information in the indexed company documents.",
+                "answer": (
+                    "I could not find relevant information in the indexed company documents."
+                ),
                 "provider": cls.provider_name,
                 "model": cls.model_name,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
                 "metadata": {"fallback_reason": "no_retrieved_chunks"},
+            }
+
+        if not allow_extractive_fallback:
+            answer = (
+                "I found usable content in the attached document, but the AI "
+                "synthesis request did not complete. Please retry the request."
+            )
+            return {
+                "answer": answer,
+                "provider": cls.provider_name,
+                "model": cls.model_name,
+                "prompt_tokens": len((prompt or "").split()),
+                "completion_tokens": len(answer.split()),
+                "total_tokens": len((prompt or "").split()) + len(answer.split()),
+                "metadata": {"fallback_reason": "synthesis_generation_unavailable"},
             }
 
         best_sentences = cls._find_relevant_sentences(question, retrieved_chunks)
@@ -137,15 +173,43 @@ class OllamaLLMProvider:
         prompt=None,
         config=None,
         allow_general_answer=False,
+        generation_options=None,
+        allow_extractive_fallback=True,
     ):
+        generation_options = generation_options or {}
         endpoint = (
             (config.endpoint_url or "http://ollama:11434").rstrip("/")
             if config
-            else "http://ollama:11434"
+            else os.getenv("OLLAMA_BASE_URL", "http://ollama:11434").rstrip("/")
         )
-        model_name = config.model_name or "llama3.2:1b"
-        temperature = float(config.temperature) if config else 0.2
-        max_tokens = config.max_tokens if config else 1200
+        model_name = generation_options.get("model") or (
+            config.model_name
+            if config and config.model_name
+            else os.getenv("OLLAMA_DEFAULT_MODEL", "qwen3:8b")
+        )
+        temperature = (
+            float(config.temperature)
+            if config
+            else float(os.getenv("OLLAMA_TEMPERATURE", "0.2"))
+        )
+        max_tokens = (
+            int(config.max_tokens)
+            if config
+            else int(os.getenv("OLLAMA_DEFAULT_MAX_TOKENS", "900"))
+        )
+        timeout = int(
+            generation_options.get(
+                "timeout",
+                os.getenv("OLLAMA_ANSWER_TIMEOUT_SECONDS", "240"),
+            )
+        )
+        max_tokens = int(generation_options.get("max_tokens", max_tokens))
+        num_ctx = int(
+            generation_options.get(
+                "num_ctx",
+                os.getenv("OLLAMA_NUM_CTX", "4096"),
+            )
+        )
 
         if not retrieved_chunks and not allow_general_answer:
             return LocalFallbackLLMProvider.generate_answer(
@@ -153,7 +217,26 @@ class OllamaLLMProvider:
                 retrieved_chunks=retrieved_chunks,
                 prompt=prompt,
                 config=config,
+                allow_general_answer=allow_general_answer,
+                allow_extractive_fallback=allow_extractive_fallback,
             )
+
+        if allow_general_answer:
+            system_content = (
+                "You are DocuX External AI. Follow the supplied prompt and evidence. "
+                "Use document context when present and web context when present. "
+                "Do not invent facts or sources. If evidence is insufficient for a "
+                "current factual claim, say that it could not be verified."
+            )
+        else:
+            system_content = (
+                "You are DocuX AI, a secure private document assistant. "
+                "Answer only using the supplied document context. "
+                "Do not invent facts. If the context does not contain the answer, say so. "
+                "Keep the answer concise and include source names when possible."
+            )
+
+        started_at = time.perf_counter()
 
         try:
             response = requests.post(
@@ -161,27 +244,19 @@ class OllamaLLMProvider:
                 json={
                     "model": model_name,
                     "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are DocuX AI, a secure private document assistant. "
-                                "Answer only using the supplied document context. "
-                                "Do not invent facts. If the context does not contain the answer, say so. "
-                                "Keep the answer concise and include source names when possible."
-                            ),
-                        },
-                        {
-                            "role": "user",
-                            "content": prompt,
-                        },
+                        {"role": "system", "content": system_content},
+                        {"role": "user", "content": prompt},
                     ],
                     "stream": False,
+                    "think": False,
+                    "keep_alive": os.getenv("OLLAMA_REQUEST_KEEP_ALIVE", "30m"),
                     "options": {
                         "temperature": temperature,
                         "num_predict": max_tokens,
+                        "num_ctx": num_ctx,
                     },
                 },
-                timeout=120,
+                timeout=timeout,
             )
             response.raise_for_status()
             data = response.json()
@@ -191,8 +266,20 @@ class OllamaLLMProvider:
             if not answer:
                 answer = "No answer generated by local Ollama model."
 
-            eval_count = data.get("eval_count", 0) or 0
-            prompt_eval_count = data.get("prompt_eval_count", 0) or 0
+            eval_count = int(data.get("eval_count", 0) or 0)
+            prompt_eval_count = int(data.get("prompt_eval_count", 0) or 0)
+            wall_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+
+            logger.info(
+                "ollama_answer_complete model=%s wall_ms=%s prompt_tokens=%s "
+                "completion_tokens=%s num_ctx=%s max_tokens=%s",
+                model_name,
+                wall_duration_ms,
+                prompt_eval_count,
+                eval_count,
+                num_ctx,
+                max_tokens,
+            )
 
             return {
                 "answer": answer,
@@ -205,22 +292,54 @@ class OllamaLLMProvider:
                     "api": "ollama_api_chat",
                     "endpoint": endpoint,
                     "done": data.get("done"),
+                    "wall_duration_ms": wall_duration_ms,
                     "total_duration": data.get("total_duration"),
                     "load_duration": data.get("load_duration"),
+                    "prompt_eval_duration": data.get("prompt_eval_duration"),
+                    "eval_duration": data.get("eval_duration"),
+                    "num_ctx": num_ctx,
+                    "max_tokens": max_tokens,
+                    "request_timeout_seconds": timeout,
                 },
             }
 
         except Exception as exc:
+            wall_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
+            error_response = getattr(exc, "response", None)
+            error_body = ""
+            if error_response is not None:
+                error_body = (getattr(error_response, "text", "") or "")[:1200]
+
+            logger.warning(
+                "ollama_answer_failed model=%s wall_ms=%s num_ctx=%s "
+                "max_tokens=%s error=%s response=%s",
+                model_name,
+                wall_duration_ms,
+                num_ctx,
+                max_tokens,
+                exc,
+                error_body,
+            )
+
             result = LocalFallbackLLMProvider.generate_answer(
                 question=question,
                 retrieved_chunks=retrieved_chunks,
                 prompt=prompt,
                 config=config,
+                allow_general_answer=allow_general_answer,
+                allow_extractive_fallback=allow_extractive_fallback,
             )
             result["metadata"]["fallback_reason"] = "ollama_request_failed"
             result["metadata"]["fallback_error"] = str(exc)
+            result["metadata"]["fallback_error_type"] = type(exc).__name__
+            result["metadata"]["wall_duration_ms"] = wall_duration_ms
             result["metadata"]["ollama_endpoint"] = endpoint
             result["metadata"]["ollama_model"] = model_name
+            result["metadata"]["ollama_num_ctx"] = num_ctx
+            result["metadata"]["ollama_max_tokens"] = max_tokens
+            result["metadata"]["request_timeout_seconds"] = timeout
+            if error_body:
+                result["metadata"]["ollama_error_response"] = error_body
             return result
 
 
@@ -409,12 +528,16 @@ class LLMGatewayService:
         prompt=None,
         provider_config=None,
         allow_general_answer=False,
+        generation_options=None,
+        allow_extractive_fallback=True,
     ):
         if not provider_config:
             return LocalFallbackLLMProvider.generate_answer(
                 question=question,
                 retrieved_chunks=retrieved_chunks,
                 prompt=prompt,
+                allow_general_answer=allow_general_answer,
+                allow_extractive_fallback=allow_extractive_fallback,
             )
 
         if provider_config.provider_type == LLMProviderConfig.ProviderType.OLLAMA:
@@ -424,6 +547,8 @@ class LLMGatewayService:
                 prompt=prompt,
                 config=provider_config,
                 allow_general_answer=allow_general_answer,
+                generation_options=generation_options,
+                allow_extractive_fallback=allow_extractive_fallback,
             )
 
         if provider_config.provider_type == LLMProviderConfig.ProviderType.OPENAI:
@@ -447,4 +572,6 @@ class LLMGatewayService:
             retrieved_chunks=retrieved_chunks,
             prompt=prompt,
             config=provider_config,
+            allow_general_answer=allow_general_answer,
+            allow_extractive_fallback=allow_extractive_fallback,
         )

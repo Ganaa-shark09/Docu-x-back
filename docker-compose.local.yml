@@ -47,7 +47,7 @@ services:
       context: .
       dockerfile: docker/local/django/Dockerfile
     container_name: docux_celery_worker
-    command: celery -A config worker -l info
+    command: celery -A config worker -l info -Q celery,document_processing
     volumes:
       - .:/app
     env_file:
@@ -85,6 +85,14 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: docux_ollama
+
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_KEEP_ALIVE: "60m"
+      OLLAMA_MAX_LOADED_MODELS: "2"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_LOAD_TIMEOUT: "10m"
+
     ports:
       - "11434:11434"
     volumes:

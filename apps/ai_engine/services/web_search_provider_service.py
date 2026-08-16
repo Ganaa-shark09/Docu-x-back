@@ -35,12 +35,33 @@ class WebSearchProviderService:
             all_results.extend(duck_response["results"])
             warnings.extend(duck_response["warnings"])
 
-        results = cls.dedupe_results(all_results)[:max_results]
+        results = cls.dedupe_results(all_results)
+        results = cls.filter_low_quality_results(query, results)[:max_results]
 
         return {
             "results": results,
             "warnings": warnings,
         }
+
+    @classmethod
+    def filter_low_quality_results(cls, query, results):
+        query_terms = {
+            term for term in re.findall(r"[a-zA-Z0-9]+", query.lower()) if len(term) > 2
+        }
+
+        if not query_terms:
+            return results
+
+        filtered = []
+
+        for result in results:
+            combined = f"{result.get('title', '')} {result.get('snippet', '')}".lower()
+            matched = [term for term in query_terms if term in combined]
+
+            if len(matched) >= 1:
+                filtered.append(result)
+
+        return filtered
 
     @staticmethod
     def dedupe_results(results):

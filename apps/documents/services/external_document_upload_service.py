@@ -3,6 +3,7 @@ from apps.documents.models import Document, DocumentVersion
 from apps.documents.services import (
     DocumentFileValidationService,
     DocumentProcessingJobService,
+    DocumentProcessingQueueService,
 )
 
 
@@ -97,9 +98,7 @@ class ExternalDocumentUploadService:
 
         DocumentProcessingJobService.create_default_jobs_for_document(document)
 
-        from apps.documents.tasks import process_document_pipeline
-
-        process_document_pipeline.delay(str(document.uuid))
+        DocumentProcessingQueueService.enqueue(document)
 
         document._external_conversation_uuid = str(conversation.uuid)
 

@@ -1,5 +1,8 @@
+from django.db.models import Q
+from django.http import FileResponse, Http404
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
@@ -10,14 +13,38 @@ from apps.documents.serializers import (
     DocumentCreateSerializer,
     DocumentDetailSerializer,
     DocumentListSerializer,
+    InternalAIDocumentListSerializer,
     DocumentProcessingJobSerializer,
     DocumentUpdateSerializer,
 )
 from apps.documents.services import (
     DocumentPermissionService,
     DocumentProcessingJobService,
+    DocumentProcessingQueueService,
 )
-from apps.documents.tasks import process_document_pipeline
+
+
+class InternalAIDocumentPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+def _secure_file_response(document, as_attachment):
+    try:
+        file_handle = document.file.open("rb")
+    except (FileNotFoundError, OSError, ValueError):
+        raise Http404("Document file is not available.")
+
+    response = FileResponse(
+        file_handle,
+        as_attachment=as_attachment,
+        filename=document.original_filename or document.title,
+        content_type=document.mime_type or "application/octet-stream",
+    )
+    response["Cache-Control"] = "private, no-store"
+    response["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 class DocumentViewSet(viewsets.ModelViewSet):
@@ -127,6 +154,94 @@ class DocumentViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         instance.soft_delete()
 
+    @action(detail=False, methods=["get"], url_path="ai-library")
+    def ai_library(self, request):
+        queryset = (
+            DocumentPermissionService.get_accessible_document_queryset(
+                user=request.user,
+                required_access="view",
+                require_ai=True,
+                scope=Document.Scope.INTERNAL,
+            )
+            .filter(
+                status=Document.Status.READY,
+                is_ai_ready=True,
+                is_indexed=True,
+            )
+            .select_related("department", "uploaded_by")
+            .prefetch_related("access_policies")
+        )
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            queryset = queryset.filter(
+                Q(title__icontains=search)
+                | Q(description__icontains=search)
+                | Q(original_filename__icontains=search)
+                | Q(department__name__icontains=search)
+                | Q(document_type__icontains=search)
+            )
+
+        department = request.query_params.get("department")
+        document_type = request.query_params.get("document_type")
+        sensitivity_label = request.query_params.get("sensitivity_label")
+
+        if department:
+            queryset = queryset.filter(department__uuid=department)
+        if document_type:
+            queryset = queryset.filter(document_type=document_type)
+        if sensitivity_label:
+            queryset = queryset.filter(sensitivity_label=sensitivity_label)
+
+        ordering = request.query_params.get("ordering", "-updated_at")
+        allowed_ordering = {
+            "title",
+            "-title",
+            "created_at",
+            "-created_at",
+            "updated_at",
+            "-updated_at",
+            "file_size",
+            "-file_size",
+        }
+        if ordering not in allowed_ordering:
+            ordering = "-updated_at"
+
+        queryset = queryset.distinct().order_by(ordering)
+
+        paginator = InternalAIDocumentPagination()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        serializer = InternalAIDocumentListSerializer(
+            page,
+            many=True,
+            context={
+                **self.get_serializer_context(),
+                "view_access_verified": True,
+            },
+        )
+        return paginator.get_paginated_response(serializer.data)
+
+    @action(detail=True, methods=["get"], url_path="preview")
+    def preview(self, request, uuid=None):
+        document = self.get_object()
+        return _secure_file_response(document, as_attachment=False)
+
+    @action(detail=True, methods=["get"], url_path="download")
+    def download(self, request, uuid=None):
+        document = self.get_object()
+
+        if not DocumentPermissionService.can_download_document(
+            user=request.user,
+            document=document,
+            assume_view_access=True,
+        ):
+            return Response(
+                {"detail": "You do not have permission to download this document."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        return _secure_file_response(document, as_attachment=True)
+
     @action(detail=True, methods=["get"], url_path="processing-jobs")
     def processing_jobs(self, request, uuid=None):
         document = self.get_object()
@@ -154,23 +269,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
 
         DocumentProcessingJobService.create_default_jobs_for_document(document)
 
-        document.status = Document.Status.UPLOADED
-        document.processing_error = ""
-        document.is_ocr_completed = False
-        document.is_ai_ready = False
-        document.is_indexed = False
-        document.save(
-            update_fields=[
-                "status",
-                "processing_error",
-                "is_ocr_completed",
-                "is_ai_ready",
-                "is_indexed",
-                "updated_at",
-            ]
-        )
-
-        process_document_pipeline.delay(str(document.uuid))
+        DocumentProcessingQueueService.enqueue(document, reset_state=True)
 
         return Response(
             {

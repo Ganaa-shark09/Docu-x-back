@@ -1,4 +1,7 @@
+from pathlib import Path as FilePath
+
 from rest_framework import serializers
+from rest_framework.reverse import reverse
 
 from apps.data_firewall.models import FirewallScan
 from apps.document_processing.models import DocumentTextExtraction
@@ -12,6 +15,7 @@ from apps.documents.services import (
     DocumentFileValidationService,
     DocumentPermissionService,
     DocumentProcessingJobService,
+    DocumentProcessingQueueService,
 )
 from apps.workspaces.models import Department
 
@@ -151,6 +155,8 @@ class DocumentListSerializer(serializers.ModelSerializer):
             "current_user_access",
             "document_type",
             "status",
+            "processing_stage",
+            "processing_progress",
             "sensitivity_label",
             "original_filename",
             "file_size",
@@ -172,6 +178,80 @@ class DocumentListSerializer(serializers.ModelSerializer):
             return None
 
         return DocumentPermissionService.get_highest_access_level(request.user, obj)
+
+
+class InternalAIDocumentListSerializer(serializers.ModelSerializer):
+    department_uuid = serializers.UUIDField(
+        source="department.uuid",
+        read_only=True,
+        allow_null=True,
+    )
+    department_name = serializers.CharField(
+        source="department.name",
+        read_only=True,
+        allow_null=True,
+    )
+    file_extension = serializers.SerializerMethodField()
+    can_download = serializers.SerializerMethodField()
+    preview_url = serializers.SerializerMethodField()
+    download_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Document
+        fields = [
+            "uuid",
+            "title",
+            "description",
+            "original_filename",
+            "file_extension",
+            "document_type",
+            "department_uuid",
+            "department_name",
+            "sensitivity_label",
+            "file_size",
+            "mime_type",
+            "page_count",
+            "status",
+            "processing_stage",
+            "processing_progress",
+            "is_indexed",
+            "is_ai_ready",
+            "can_download",
+            "preview_url",
+            "download_url",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_file_extension(self, obj):
+        return FilePath(obj.original_filename or "").suffix.lower()
+
+    def get_can_download(self, obj):
+        request = self.context.get("request")
+        if not request:
+            return False
+        return DocumentPermissionService.can_download_document(
+            request.user,
+            obj,
+            assume_view_access=bool(self.context.get("view_access_verified")),
+        )
+
+    def _build_url(self, obj, route_name):
+        request = self.context.get("request")
+        return reverse(
+            route_name,
+            kwargs={"uuid": obj.uuid},
+            request=request,
+        )
+
+    def get_preview_url(self, obj):
+        return self._build_url(obj, "documents-preview")
+
+    def get_download_url(self, obj):
+        if not self.get_can_download(obj):
+            return None
+        return self._build_url(obj, "documents-download")
 
 
 class DocumentDetailSerializer(serializers.ModelSerializer):
@@ -200,6 +280,8 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             "current_user_access",
             "document_type",
             "status",
+            "processing_stage",
+            "processing_progress",
             "sensitivity_label",
             "original_filename",
             "file",
@@ -227,6 +309,8 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             "uploaded_by_email",
             "current_user_access",
             "status",
+            "processing_stage",
+            "processing_progress",
             "original_filename",
             "file_size",
             "mime_type",
@@ -323,9 +407,7 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
 
         DocumentProcessingJobService.create_default_jobs_for_document(document)
 
-        from apps.documents.tasks import process_document_pipeline
-
-        process_document_pipeline.delay(str(document.uuid))
+        DocumentProcessingQueueService.enqueue(document)
 
         return document
 

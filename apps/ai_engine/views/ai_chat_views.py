@@ -1,3 +1,4 @@
+from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -9,6 +10,9 @@ from apps.ai_engine.serializers import (
     AIConversationListSerializer,
 )
 from apps.ai_engine.services import RAGChatService
+from apps.ai_engine.services.internal_document_scope_service import (
+    InternalDocumentScopeError,
+)
 
 
 def get_client_ip(request):
@@ -33,17 +37,28 @@ class AIChatAPIView(APIView):
         serializer = AIChatRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        result = RAGChatService.chat(
-            user=request.user,
-            message=serializer.validated_data["message"],
-            conversation_uuid=serializer.validated_data.get("conversation_uuid"),
-            department_uuid=serializer.validated_data.get("department"),
-            document_type=serializer.validated_data.get("document_type"),
-            sensitivity_label=serializer.validated_data.get("sensitivity_label"),
-            top_k=serializer.validated_data.get("top_k", 5),
-            ip_address=get_client_ip(request),
-            user_agent=request.META.get("HTTP_USER_AGENT", ""),
-        )
+        try:
+            result = RAGChatService.chat(
+                user=request.user,
+                message=serializer.validated_data["message"],
+                conversation_uuid=serializer.validated_data.get("conversation_uuid"),
+                department_uuid=serializer.validated_data.get("department"),
+                document_type=serializer.validated_data.get("document_type"),
+                sensitivity_label=serializer.validated_data.get("sensitivity_label"),
+                document_scope=serializer.validated_data.get("document_scope", "all"),
+                document_uuids=serializer.validated_data.get("document_uuids", []),
+                top_k=serializer.validated_data.get("top_k", 5),
+                ip_address=get_client_ip(request),
+                user_agent=request.META.get("HTTP_USER_AGENT", ""),
+            )
+        except InternalDocumentScopeError as exc:
+            payload = {
+                "detail": exc.detail,
+                "code": exc.code,
+            }
+            if exc.unavailable_document_uuids:
+                payload["unavailable_document_uuids"] = exc.unavailable_document_uuids
+            return Response(payload, status=status.HTTP_400_BAD_REQUEST)
 
         assistant_message = result["assistant_message"]
 
@@ -53,6 +68,7 @@ class AIChatAPIView(APIView):
                 "message_uuid": assistant_message.uuid,
                 "answer": assistant_message.content,
                 "sources": result["sources"],
+                "document_context": result["document_context"],
                 "firewall": result["firewall"],
                 "model_provider": assistant_message.model_provider,
                 "model_name": assistant_message.model_name,
@@ -92,7 +108,7 @@ class AIConversationListAPIView(generics.ListAPIView):
         ).order_by("-updated_at")
 
 
-class AIConversationDetailAPIView(generics.RetrieveAPIView):
+class AIConversationDetailAPIView(generics.RetrieveDestroyAPIView):
     serializer_class = AIConversationDetailSerializer
     permission_classes = [permissions.IsAuthenticated]
     lookup_field = "uuid"
@@ -106,4 +122,32 @@ class AIConversationDetailAPIView(generics.RetrieveAPIView):
             )
             .select_related("department", "company", "user")
             .prefetch_related("messages")
+        )
+
+    def perform_destroy(self, instance):
+        # Conversation deletion is intentionally reversible. Messages and
+        # attachments remain intact for audit/history and can be restored later.
+        instance.status = AIConversation.Status.ARCHIVED
+        instance.save(update_fields=["status", "updated_at"])
+        instance.soft_delete()
+
+
+class AIConversationRestoreAPIView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, uuid):
+        conversation = get_object_or_404(
+            AIConversation,
+            uuid=uuid,
+            company=request.user.company,
+            user=request.user,
+            is_deleted=True,
+        )
+        conversation.restore()
+        conversation.status = AIConversation.Status.ACTIVE
+        conversation.save(update_fields=["status", "updated_at"])
+
+        return Response(
+            AIConversationListSerializer(conversation).data,
+            status=status.HTTP_200_OK,
         )

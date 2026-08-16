@@ -5,6 +5,7 @@ from apps.ai_engine.views import (
     AIChatAPIView,
     AIConversationDetailAPIView,
     AIConversationListAPIView,
+    AIConversationRestoreAPIView,
     ExternalChatAPIView,
     ExternalDocumentExtractedTextAPIView,
     ExternalConversationRetrievalDebugAPIView,
@@ -40,6 +41,11 @@ urlpatterns = [
         "conversations/<uuid:uuid>/",
         AIConversationDetailAPIView.as_view(),
         name="ai-conversation-detail",
+    ),
+    path(
+        "conversations/<uuid:uuid>/restore/",
+        AIConversationRestoreAPIView.as_view(),
+        name="ai-conversation-restore",
     ),
 ]
 

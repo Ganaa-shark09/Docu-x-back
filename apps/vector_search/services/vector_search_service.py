@@ -29,7 +29,9 @@ class VectorSearchService:
                 company=company,
                 is_deleted=False,
                 document__is_deleted=False,
+                document__status=Document.Status.READY,
                 document__is_ai_ready=True,
+                document__is_indexed=True,
                 document__scope=scope,
             )
             .select_related("document", "department", "company")
@@ -73,6 +75,8 @@ class VectorSearchService:
                     "chunk_uuid": str(chunk.uuid),
                     "document_uuid": str(chunk.document.uuid),
                     "document_title": chunk.document.title,
+                    "document_filename": chunk.document.original_filename,
+                    "document_mime_type": chunk.document.mime_type,
                     "document_scope": chunk.document.scope,
                     "department_uuid": str(chunk.department.uuid)
                     if chunk.department
@@ -82,6 +86,7 @@ class VectorSearchService:
                     else None,
                     "document_type": chunk.document_type,
                     "sensitivity_label": chunk.sensitivity_label,
+                    "page_number": chunk.page_number,
                     "chunk_index": chunk.chunk_index,
                     "content": chunk.content,
                     "score": round(score, 4),

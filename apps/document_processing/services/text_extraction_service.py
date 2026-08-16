@@ -4,6 +4,10 @@ from pathlib import Path
 import pdfplumber
 import pytesseract
 from docx import Document as DocxDocument
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 from openpyxl import load_workbook
 from PIL import Image, ImageEnhance, ImageFilter
 
@@ -55,8 +59,9 @@ class TextExtractionService:
         pages_text = []
 
         with pdfplumber.open(file_path) as pdf:
-            for page in pdf.pages:
-                pages_text.append(page.extract_text() or "")
+            for page_number, page in enumerate(pdf.pages, start=1):
+                page_text = (page.extract_text() or "").strip()
+                pages_text.append(f"[Page {page_number}]\n{page_text}".strip())
 
         text = "\n\n".join(pages_text).strip()
 
@@ -163,6 +168,8 @@ class TextExtractionService:
                 "ocr_error": ocr_error,
                 "vision_provider": vision_result.get("provider"),
                 "vision_model": vision_result.get("model"),
+                "vision_model_tier": vision_result.get("model_tier"),
+                "vision_wall_duration_ms": vision_result.get("wall_duration_ms", 0),
                 "vision_error": vision_result.get("error"),
                 "vision_discarded": vision_discarded,
                 "vision_discarded_reason": vision_discarded_reason,
@@ -290,31 +297,74 @@ class TextExtractionService:
     @classmethod
     def extract_docx(cls, document, file_path):
         doc = DocxDocument(file_path)
+        blocks = []
+        table_index = 0
 
-        paragraphs = [
-            paragraph.text.strip()
-            for paragraph in doc.paragraphs
-            if paragraph.text.strip()
-        ]
+        # python-docx exposes paragraphs and tables as separate collections.
+        # Joining all paragraphs first and all tables afterwards destroys the
+        # source order, which is particularly harmful for long-document
+        # summaries. Walk the document body instead so headings, prose, and
+        # tables stay in the same sequence as the original DOCX.
+        for block in cls.iter_docx_blocks(doc):
+            if isinstance(block, Paragraph):
+                value = block.text.strip()
+                if not value:
+                    continue
 
-        table_lines = []
+                style_name = (getattr(block.style, "name", "") or "").strip()
+                if style_name.lower().startswith("heading"):
+                    blocks.append(f"[{style_name}] {value}")
+                else:
+                    blocks.append(value)
+                continue
 
-        for table in doc.tables:
-            for row in table.rows:
-                values = [cell.text.strip() for cell in row.cells]
-                if any(values):
-                    table_lines.append(" | ".join(values))
+            if isinstance(block, Table):
+                table_index += 1
+                rows = []
 
-        text = "\n".join(paragraphs + table_lines).strip()
+                for row in block.rows:
+                    values = [
+                        re.sub(r"\s+", " ", cell.text.strip()) for cell in row.cells
+                    ]
+                    if any(values):
+                        rows.append(" | ".join(values))
+
+                if rows:
+                    blocks.append(f"[Table {table_index}]\n" + "\n".join(rows))
+
+        text = "\n\n".join(blocks).strip()
+        page_count = cls.estimate_docx_page_count(doc)
 
         return cls.save_extraction(
             document=document,
             text=text,
             extraction_method=DocumentTextExtraction.ExtractionMethod.PLAIN_TEXT,
-            page_count=1,
-            confidence_score=85 if text else 0,
-            metadata={"source": "python_docx"},
+            page_count=page_count,
+            confidence_score=90 if text else 0,
+            metadata={
+                "source": "python_docx",
+                "preserves_block_order": True,
+                "table_count": table_index,
+                "estimated_page_count": page_count,
+            },
         )
+
+    @staticmethod
+    def iter_docx_blocks(doc):
+        for child in doc.element.body.iterchildren():
+            if isinstance(child, CT_P):
+                yield Paragraph(child, doc)
+            elif isinstance(child, CT_Tbl):
+                yield Table(child, doc)
+
+    @staticmethod
+    def estimate_docx_page_count(doc):
+        # DOCX does not store a universally reliable rendered page count.
+        # Explicit page breaks are deterministic, however, and give a useful
+        # estimate for documents that were authored with page breaks.
+        page_breaks = doc.element.body.xpath('.//w:br[@w:type="page"]')
+        rendered_breaks = doc.element.body.xpath(".//w:lastRenderedPageBreak")
+        return max(1, 1 + len(page_breaks) + len(rendered_breaks))
 
     @classmethod
     def extract_xlsx(cls, document, file_path):

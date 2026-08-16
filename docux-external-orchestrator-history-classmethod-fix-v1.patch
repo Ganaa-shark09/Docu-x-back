@@ -1,0 +1,10 @@
+diff --git a/apps/ai_engine/services/external_semantic_orchestrator_service.py b/apps/ai_engine/services/external_semantic_orchestrator_service.py
+--- a/apps/ai_engine/services/external_semantic_orchestrator_service.py
++++ b/apps/ai_engine/services/external_semantic_orchestrator_service.py
+@@ -657,8 +657,8 @@ class ExternalSemanticOrchestratorService:
+-    @staticmethod
+-    def _build_history(conversation, current_user_message_uuid=None):
++    @classmethod
++    def _build_history(cls, conversation, current_user_message_uuid=None):
+         if conversation is None:
+             return []

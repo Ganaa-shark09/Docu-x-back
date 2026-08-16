@@ -2,6 +2,7 @@ from .ai_chat_views import (
     AIChatAPIView,
     AIConversationDetailAPIView,
     AIConversationListAPIView,
+    AIConversationRestoreAPIView,
 )
 from .external_ai_views import ExternalChatAPIView, ExternalDocumentViewSet
 from .llm_provider_views import LLMProviderConfigViewSet
@@ -10,6 +11,7 @@ __all__ = [
     "AIChatAPIView",
     "AIConversationDetailAPIView",
     "AIConversationListAPIView",
+    "AIConversationRestoreAPIView",
     "ExternalChatAPIView",
     "ExternalDocumentViewSet",
     "LLMProviderConfigViewSet",

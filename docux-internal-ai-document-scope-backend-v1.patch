@@ -1,0 +1,1012 @@
+diff --git a/apps/ai_engine/serializers/ai_chat_serializers.py b/apps/ai_engine/serializers/ai_chat_serializers.py
+index 5ac6777..605bd7c 100644
+--- a/apps/ai_engine/serializers/ai_chat_serializers.py
++++ b/apps/ai_engine/serializers/ai_chat_serializers.py
+@@ -61,21 +61,72 @@ class AIConversationDetailSerializer(serializers.ModelSerializer):
+
+
+ class AIChatRequestSerializer(serializers.Serializer):
++    DOCUMENT_SCOPE_ALL = "all"
++    DOCUMENT_SCOPE_SELECTED = "selected"
++
+     message = serializers.CharField()
+     conversation_uuid = serializers.UUIDField(required=False)
+     department = serializers.UUIDField(required=False)
+     document_type = serializers.CharField(required=False)
+     sensitivity_label = serializers.CharField(required=False)
++    document_scope = serializers.ChoiceField(
++        choices=[DOCUMENT_SCOPE_ALL, DOCUMENT_SCOPE_SELECTED],
++        required=False,
++        default=DOCUMENT_SCOPE_ALL,
++    )
++    document_uuids = serializers.ListField(
++        child=serializers.UUIDField(),
++        required=False,
++        allow_empty=True,
++        max_length=50,
++        default=list,
++    )
+     top_k = serializers.IntegerField(
+         required=False, min_value=1, max_value=20, default=5
+     )
+
++    def validate(self, attrs):
++        document_uuids = attrs.get("document_uuids", [])
++
++        # Preserve order while preventing duplicate document filters.
++        deduplicated = list(dict.fromkeys(document_uuids))
++        attrs["document_uuids"] = deduplicated
++
++        # Ergonomic/backward-compatible behavior: if UUIDs are supplied and the
++        # client omitted document_scope, infer an explicitly selected scope.
++        if deduplicated and "document_scope" not in self.initial_data:
++            attrs["document_scope"] = self.DOCUMENT_SCOPE_SELECTED
++
++        document_scope = attrs.get("document_scope", self.DOCUMENT_SCOPE_ALL)
++
++        if document_scope == self.DOCUMENT_SCOPE_SELECTED and not deduplicated:
++            raise serializers.ValidationError(
++                {
++                    "document_uuids": (
++                        "At least one document UUID is required when "
++                        "document_scope is 'selected'."
++                    )
++                }
++            )
++
++        if document_scope == self.DOCUMENT_SCOPE_ALL and deduplicated:
++            raise serializers.ValidationError(
++                {
++                    "document_uuids": (
++                        "document_uuids must be empty when document_scope is 'all'."
++                    )
++                }
++            )
++
++        return attrs
++
+
+ class AIChatResponseSerializer(serializers.Serializer):
+     conversation_uuid = serializers.UUIDField()
+     message_uuid = serializers.UUIDField()
+     answer = serializers.CharField()
+     sources = serializers.ListField()
++    document_context = serializers.DictField()
+     model_provider = serializers.CharField()
+     model_name = serializers.CharField()
+     usage = serializers.DictField()
+diff --git a/apps/ai_engine/services/__init__.py b/apps/ai_engine/services/__init__.py
+index cb451fa..3b43e4e 100644
+--- a/apps/ai_engine/services/__init__.py
++++ b/apps/ai_engine/services/__init__.py
+@@ -5,6 +5,11 @@ from .external_extractive_qa_service import ExternalExtractiveQAService
+ from .external_intent_router_service import ExternalIntentRouterService
+ from .llm_gateway_service import LLMGatewayService
+ from .llm_provider_config_service import LLMProviderConfigService
++from .internal_document_scope_service import (
++    InternalDocumentScopeError,
++    InternalDocumentScopeService,
++    ResolvedInternalDocumentScope,
++)
+ from .rag_service import RAGChatService
+ from .web_search_provider_service import WebSearchProviderService
+
+@@ -16,6 +21,9 @@ __all__ = [
+     "ExternalIntentRouterService",
+     "LLMGatewayService",
+     "LLMProviderConfigService",
++    "InternalDocumentScopeError",
++    "InternalDocumentScopeService",
++    "ResolvedInternalDocumentScope",
+     "RAGChatService",
+     "WebSearchProviderService",
+     "ExternalIntentClassifierService",
+diff --git a/apps/ai_engine/services/internal_document_scope_service.py b/apps/ai_engine/services/internal_document_scope_service.py
+new file mode 100644
+index 0000000..e405a44
+--- /dev/null
++++ b/apps/ai_engine/services/internal_document_scope_service.py
+@@ -0,0 +1,155 @@
++from dataclasses import dataclass
++from typing import Iterable
++
++from apps.documents.models import Document
++from apps.documents.services import DocumentPermissionService
++
++
++class InternalDocumentScopeError(Exception):
++    def __init__(
++        self,
++        detail,
++        code="invalid_document_scope",
++        unavailable_document_uuids=None,
++    ):
++        super().__init__(detail)
++        self.detail = detail
++        self.code = code
++        self.unavailable_document_uuids = unavailable_document_uuids or []
++
++
++@dataclass(frozen=True)
++class ResolvedInternalDocumentScope:
++    mode: str
++    queryset: object
++    document_uuids: tuple[str, ...]
++    document_titles: tuple[str, ...]
++    accessible_document_count: int
++    selected_document_count: int
++
++    @property
++    def search_document_uuids(self):
++        if self.mode == InternalDocumentScopeService.SELECTED:
++            return list(self.document_uuids)
++        return None
++
++    def as_metadata(self):
++        return {
++            "mode": self.mode,
++            "document_uuids": list(self.document_uuids),
++            "document_titles": list(self.document_titles),
++            "accessible_document_count": self.accessible_document_count,
++            "selected_document_count": self.selected_document_count,
++        }
++
++
++class InternalDocumentScopeService:
++    ALL = "all"
++    SELECTED = "selected"
++    VALID_MODES = {ALL, SELECTED}
++
++    @classmethod
++    def normalize_uuids(cls, values: Iterable | None):
++        if not values:
++            return []
++
++        if isinstance(values, str):
++            values = [part.strip() for part in values.split(",")]
++
++        output = []
++        seen = set()
++
++        for value in values:
++            normalized = str(value).strip()
++            if not normalized or normalized in seen:
++                continue
++            seen.add(normalized)
++            output.append(normalized)
++
++        return output
++
++    @classmethod
++    def get_ai_ready_queryset(cls, user):
++        return (
++            DocumentPermissionService.get_accessible_document_queryset(
++                user=user,
++                required_access="view",
++                require_ai=True,
++                scope=Document.Scope.INTERNAL,
++            )
++            .filter(
++                status=Document.Status.READY,
++                is_ai_ready=True,
++                is_indexed=True,
++            )
++            .select_related("department", "uploaded_by")
++            .distinct()
++        )
++
++    @classmethod
++    def resolve(cls, user, document_scope=ALL, document_uuids=None):
++        mode = (document_scope or cls.ALL).strip().lower()
++        normalized_uuids = cls.normalize_uuids(document_uuids)
++
++        if mode not in cls.VALID_MODES:
++            raise InternalDocumentScopeError(
++                "document_scope must be either 'all' or 'selected'.",
++                code="invalid_document_scope",
++            )
++
++        if mode == cls.ALL and normalized_uuids:
++            raise InternalDocumentScopeError(
++                "document_uuids must be empty when document_scope is 'all'.",
++                code="document_scope_mismatch",
++            )
++
++        if mode == cls.SELECTED and not normalized_uuids:
++            raise InternalDocumentScopeError(
++                (
++                    "At least one document UUID is required when "
++                    "document_scope is 'selected'."
++                ),
++                code="selected_documents_required",
++            )
++
++        accessible_queryset = cls.get_ai_ready_queryset(user)
++        accessible_document_count = accessible_queryset.count()
++
++        if mode == cls.ALL:
++            return ResolvedInternalDocumentScope(
++                mode=mode,
++                queryset=accessible_queryset,
++                document_uuids=tuple(),
++                document_titles=tuple(),
++                accessible_document_count=accessible_document_count,
++                selected_document_count=0,
++            )
++
++        selected_queryset = accessible_queryset.filter(uuid__in=normalized_uuids)
++        selected_rows = list(selected_queryset.values_list("uuid", "title"))
++        found_by_uuid = {str(uuid): title for uuid, title in selected_rows}
++
++        unavailable = [
++            document_uuid
++            for document_uuid in normalized_uuids
++            if document_uuid not in found_by_uuid
++        ]
++
++        if unavailable:
++            raise InternalDocumentScopeError(
++                "One or more selected documents are unavailable for Internal AI. "
++                "They may be missing, inaccessible, not fully processed, or not indexed.",
++                code="selected_documents_unavailable",
++                unavailable_document_uuids=unavailable,
++            )
++
++        ordered_titles = tuple(found_by_uuid[uuid] for uuid in normalized_uuids)
++
++        return ResolvedInternalDocumentScope(
++            mode=mode,
++            queryset=selected_queryset,
++            document_uuids=tuple(normalized_uuids),
++            document_titles=ordered_titles,
++            accessible_document_count=accessible_document_count,
++            selected_document_count=len(normalized_uuids),
++        )
+diff --git a/apps/ai_engine/services/prompt_builder_service.py b/apps/ai_engine/services/prompt_builder_service.py
+index 6b21275..1489222 100644
+--- a/apps/ai_engine/services/prompt_builder_service.py
++++ b/apps/ai_engine/services/prompt_builder_service.py
+@@ -3,29 +3,53 @@ class PromptBuilderService:
+ You are DocuX AI, a secure private document assistant.
+
+ Rules:
+-1. Answer only using the provided context.
+-2. If the answer is not available in the context, say that the uploaded documents do not contain enough information.
+-3. Do not invent facts.
+-4. Be concise and business-friendly.
+-5. Mention source references when possible.
++1. Answer only using the authorized document context provided below.
++2. If the answer is not available in that context, say that the available company documents do not contain enough information.
++3. Do not use outside knowledge to fill gaps and do not invent facts.
++4. Be concise, accurate, and business-friendly.
++5. Cite the supplied source names, page numbers, or chunk references when useful.
++6. Never imply that you searched or used a document that is not present in the supplied context.
+ """.strip()
+
+     @classmethod
+-    def build_rag_prompt(cls, user_question, retrieved_chunks):
++    def build_rag_prompt(
++        cls,
++        user_question,
++        retrieved_chunks,
++        document_scope="all",
++        selected_document_titles=None,
++    ):
+         context_blocks = []
+
+         for index, chunk in enumerate(retrieved_chunks, start=1):
++            page_number = chunk.get("page_number")
++            page_line = f"Page: {page_number}\n" if page_number else ""
+             context_blocks.append(
+                 f"[Source {index}]\n"
+                 f"Document: {chunk.get('document_title')}\n"
++                f"{page_line}"
+                 f"Chunk: {chunk.get('chunk_index')}\n"
+                 f"Content:\n{chunk.get('content')}"
+             )
+
+         context = "\n\n---\n\n".join(context_blocks)
+
++        if document_scope == "selected":
++            selected_titles = [str(title) for title in (selected_document_titles or [])]
++            selected_display = ", ".join(selected_titles) or "the explicitly selected documents"
++            scope_instruction = (
++                "Document scope: SELECTED DOCUMENTS ONLY. The user explicitly selected: "
++                f"{selected_display}. Do not answer from or refer to any other company document."
++            )
++        else:
++            scope_instruction = (
++                "Document scope: ALL AUTHORIZED INTERNAL DOCUMENTS. The retrieved context "
++                "was selected from the user's complete accessible Internal AI library."
++            )
++
+         return (
+             f"{cls.SYSTEM_INSTRUCTIONS}\n\n"
++            f"{scope_instruction}\n\n"
+             f"Context:\n{context}\n\n"
+             f"User Question:\n{user_question}\n\n"
+             f"Answer:"
+diff --git a/apps/ai_engine/services/rag_service.py b/apps/ai_engine/services/rag_service.py
+index 27da25f..9f1db29 100644
+--- a/apps/ai_engine/services/rag_service.py
++++ b/apps/ai_engine/services/rag_service.py
+@@ -1,6 +1,9 @@
+ from django.db import transaction
+
+ from apps.ai_engine.models import AIConversation, AIMessage
++from apps.ai_engine.services.internal_document_scope_service import (
++    InternalDocumentScopeService,
++)
+ from apps.ai_engine.services.llm_gateway_service import LLMGatewayService
+ from apps.ai_engine.services.llm_provider_config_service import LLMProviderConfigService
+ from apps.ai_engine.services.prompt_builder_service import PromptBuilderService
+@@ -21,11 +24,23 @@ class RAGChatService:
+         department_uuid=None,
+         document_type=None,
+         sensitivity_label=None,
++        document_scope=InternalDocumentScopeService.ALL,
++        document_uuids=None,
+         top_k=5,
+         scope=Document.Scope.INTERNAL,
+         ip_address=None,
+         user_agent="",
+     ):
++        if scope != Document.Scope.INTERNAL:
++            raise ValueError("RAGChatService only supports Internal AI document scope.")
++
++        resolved_document_scope = InternalDocumentScopeService.resolve(
++            user=user,
++            document_scope=document_scope,
++            document_uuids=document_uuids,
++        )
++        document_scope_metadata = resolved_document_scope.as_metadata()
++
+         conversation = cls._get_or_create_conversation(
+             user=user,
+             message=message,
+@@ -38,6 +53,9 @@ class RAGChatService:
+             conversation=conversation,
+             role=AIMessage.Role.USER,
+             content=message,
++            metadata={
++                "document_scope": document_scope_metadata,
++            },
+         )
+
+         retrieved_chunks = VectorSearchService.search(
+@@ -49,6 +67,7 @@ class RAGChatService:
+             sensitivity_label=sensitivity_label,
+             top_k=top_k,
+             scope=scope,
++            document_uuids=resolved_document_scope.search_document_uuids,
+         )
+
+         requested_provider_config = (
+@@ -67,6 +86,8 @@ class RAGChatService:
+         prompt = PromptBuilderService.build_rag_prompt(
+             user_question=message,
+             retrieved_chunks=safe_chunks,
++            document_scope=resolved_document_scope.mode,
++            selected_document_titles=resolved_document_scope.document_titles,
+         )
+
+         if not safe_chunks and enforcement_result.get("blocked_count", 0) > 0:
+@@ -108,6 +129,7 @@ class RAGChatService:
+                 "document_type": document_type,
+                 "sensitivity_label": sensitivity_label,
+                 "department_uuid": str(department_uuid) if department_uuid else None,
++                "document_scope": document_scope_metadata,
+                 "user_message_uuid": str(user_message.uuid),
+                 "llm_metadata": llm_result.get("metadata", {}),
+                 "firewall_enforcement": {
+@@ -145,6 +167,7 @@ class RAGChatService:
+             "user_message": user_message,
+             "assistant_message": assistant_message,
+             "sources": assistant_message.retrieved_sources,
++            "document_context": document_scope_metadata,
+             "firewall": {
+                 "requested_provider_type": enforcement_result.get(
+                     "requested_provider_type"
+@@ -209,8 +232,11 @@ class RAGChatService:
+                     "chunk_uuid": chunk.get("chunk_uuid"),
+                     "document_uuid": chunk.get("document_uuid"),
+                     "document_title": chunk.get("document_title"),
++                    "document_filename": chunk.get("document_filename"),
++                    "document_mime_type": chunk.get("document_mime_type"),
+                     "department_uuid": chunk.get("department_uuid"),
+                     "department_name": chunk.get("department_name"),
++                    "page_number": chunk.get("page_number"),
+                     "chunk_index": chunk.get("chunk_index"),
+                     "score": chunk.get("score"),
+                     "distance": chunk.get("distance"),
+diff --git a/apps/ai_engine/tests/test_internal_ai_chat_serializer.py b/apps/ai_engine/tests/test_internal_ai_chat_serializer.py
+new file mode 100644
+index 0000000..b9fc2d6
+--- /dev/null
++++ b/apps/ai_engine/tests/test_internal_ai_chat_serializer.py
+@@ -0,0 +1,50 @@
++import uuid
++
++from django.test import SimpleTestCase
++
++from apps.ai_engine.serializers import AIChatRequestSerializer
++
++
++class AIChatRequestSerializerTests(SimpleTestCase):
++    def test_defaults_to_all_documents_when_no_selection_is_supplied(self):
++        serializer = AIChatRequestSerializer(
++            data={"message": "What is our leave policy?"}
++        )
++        self.assertTrue(serializer.is_valid(), serializer.errors)
++        self.assertEqual(serializer.validated_data["document_scope"], "all")
++        self.assertEqual(serializer.validated_data["document_uuids"], [])
++
++    def test_infers_selected_scope_when_document_uuids_are_supplied(self):
++        first = uuid.uuid4()
++        second = uuid.uuid4()
++        serializer = AIChatRequestSerializer(
++            data={
++                "message": "Compare these policies.",
++                "document_uuids": [str(first), str(second), str(first)],
++            }
++        )
++        self.assertTrue(serializer.is_valid(), serializer.errors)
++        self.assertEqual(serializer.validated_data["document_scope"], "selected")
++        self.assertEqual(serializer.validated_data["document_uuids"], [first, second])
++
++    def test_selected_scope_requires_at_least_one_document(self):
++        serializer = AIChatRequestSerializer(
++            data={
++                "message": "Summarize this document.",
++                "document_scope": "selected",
++                "document_uuids": [],
++            }
++        )
++        self.assertFalse(serializer.is_valid())
++        self.assertIn("document_uuids", serializer.errors)
++
++    def test_all_scope_rejects_document_uuids(self):
++        serializer = AIChatRequestSerializer(
++            data={
++                "message": "Question",
++                "document_scope": "all",
++                "document_uuids": [str(uuid.uuid4())],
++            }
++        )
++        self.assertFalse(serializer.is_valid())
++        self.assertIn("document_uuids", serializer.errors)
+diff --git a/apps/ai_engine/tests/test_internal_document_scope_service.py b/apps/ai_engine/tests/test_internal_document_scope_service.py
+new file mode 100644
+index 0000000..b0905fe
+--- /dev/null
++++ b/apps/ai_engine/tests/test_internal_document_scope_service.py
+@@ -0,0 +1,90 @@
++import uuid
++from types import SimpleNamespace
++from unittest.mock import MagicMock, patch
++
++from django.test import SimpleTestCase
++
++from apps.ai_engine.services.internal_document_scope_service import (
++    InternalDocumentScopeError,
++    InternalDocumentScopeService,
++)
++
++
++class InternalDocumentScopeServiceTests(SimpleTestCase):
++    def _ready_queryset(self, rows):
++        queryset = MagicMock()
++        queryset.count.return_value = len(rows)
++        queryset.values_list.return_value = rows
++        return queryset
++
++    @patch.object(InternalDocumentScopeService, "get_ai_ready_queryset")
++    def test_all_scope_uses_all_accessible_ai_ready_documents(self, get_queryset):
++        queryset = self._ready_queryset([])
++        queryset.count.return_value = 7
++        get_queryset.return_value = queryset
++
++        result = InternalDocumentScopeService.resolve(
++            user=SimpleNamespace(),
++            document_scope="all",
++            document_uuids=[],
++        )
++
++        self.assertEqual(result.mode, "all")
++        self.assertIsNone(result.search_document_uuids)
++        self.assertEqual(result.accessible_document_count, 7)
++        self.assertEqual(result.selected_document_count, 0)
++
++    @patch.object(InternalDocumentScopeService, "get_ai_ready_queryset")
++    def test_selected_scope_returns_only_requested_accessible_documents(
++        self, get_queryset
++    ):
++        first = uuid.uuid4()
++        second = uuid.uuid4()
++
++        accessible = MagicMock()
++        accessible.count.return_value = 4
++        selected = self._ready_queryset(
++            [
++                (first, "Policy A"),
++                (second, "Policy B"),
++            ]
++        )
++        accessible.filter.return_value = selected
++        get_queryset.return_value = accessible
++
++        result = InternalDocumentScopeService.resolve(
++            user=SimpleNamespace(),
++            document_scope="selected",
++            document_uuids=[first, second],
++        )
++
++        self.assertEqual(result.mode, "selected")
++        self.assertEqual(result.search_document_uuids, [str(first), str(second)])
++        self.assertEqual(result.document_titles, ("Policy A", "Policy B"))
++        self.assertEqual(result.selected_document_count, 2)
++
++    @patch.object(InternalDocumentScopeService, "get_ai_ready_queryset")
++    def test_selected_scope_rejects_missing_or_inaccessible_documents(
++        self, get_queryset
++    ):
++        allowed = uuid.uuid4()
++        unavailable = uuid.uuid4()
++
++        accessible = MagicMock()
++        accessible.count.return_value = 1
++        selected = self._ready_queryset([(allowed, "Allowed")])
++        accessible.filter.return_value = selected
++        get_queryset.return_value = accessible
++
++        with self.assertRaises(InternalDocumentScopeError) as context:
++            InternalDocumentScopeService.resolve(
++                user=SimpleNamespace(),
++                document_scope="selected",
++                document_uuids=[allowed, unavailable],
++            )
++
++        self.assertEqual(context.exception.code, "selected_documents_unavailable")
++        self.assertEqual(
++            context.exception.unavailable_document_uuids,
++            [str(unavailable)],
++        )
+diff --git a/apps/ai_engine/views/ai_chat_views.py b/apps/ai_engine/views/ai_chat_views.py
+index b1cf9bc..56280b8 100644
+--- a/apps/ai_engine/views/ai_chat_views.py
++++ b/apps/ai_engine/views/ai_chat_views.py
+@@ -10,6 +10,9 @@ from apps.ai_engine.serializers import (
+     AIConversationListSerializer,
+ )
+ from apps.ai_engine.services import RAGChatService
++from apps.ai_engine.services.internal_document_scope_service import (
++    InternalDocumentScopeError,
++)
+
+
+ def get_client_ip(request):
+@@ -34,17 +37,28 @@ class AIChatAPIView(APIView):
+         serializer = AIChatRequestSerializer(data=request.data)
+         serializer.is_valid(raise_exception=True)
+
+-        result = RAGChatService.chat(
+-            user=request.user,
+-            message=serializer.validated_data["message"],
+-            conversation_uuid=serializer.validated_data.get("conversation_uuid"),
+-            department_uuid=serializer.validated_data.get("department"),
+-            document_type=serializer.validated_data.get("document_type"),
+-            sensitivity_label=serializer.validated_data.get("sensitivity_label"),
+-            top_k=serializer.validated_data.get("top_k", 5),
+-            ip_address=get_client_ip(request),
+-            user_agent=request.META.get("HTTP_USER_AGENT", ""),
+-        )
++        try:
++            result = RAGChatService.chat(
++                user=request.user,
++                message=serializer.validated_data["message"],
++                conversation_uuid=serializer.validated_data.get("conversation_uuid"),
++                department_uuid=serializer.validated_data.get("department"),
++                document_type=serializer.validated_data.get("document_type"),
++                sensitivity_label=serializer.validated_data.get("sensitivity_label"),
++                document_scope=serializer.validated_data.get("document_scope", "all"),
++                document_uuids=serializer.validated_data.get("document_uuids", []),
++                top_k=serializer.validated_data.get("top_k", 5),
++                ip_address=get_client_ip(request),
++                user_agent=request.META.get("HTTP_USER_AGENT", ""),
++            )
++        except InternalDocumentScopeError as exc:
++            payload = {
++                "detail": exc.detail,
++                "code": exc.code,
++            }
++            if exc.unavailable_document_uuids:
++                payload["unavailable_document_uuids"] = exc.unavailable_document_uuids
++            return Response(payload, status=status.HTTP_400_BAD_REQUEST)
+
+         assistant_message = result["assistant_message"]
+
+@@ -54,6 +68,7 @@ class AIChatAPIView(APIView):
+                 "message_uuid": assistant_message.uuid,
+                 "answer": assistant_message.content,
+                 "sources": result["sources"],
++                "document_context": result["document_context"],
+                 "firewall": result["firewall"],
+                 "model_provider": assistant_message.model_provider,
+                 "model_name": assistant_message.model_name,
+diff --git a/apps/documents/permissions/document_permissions.py b/apps/documents/permissions/document_permissions.py
+index 37f77e7..73bb112 100644
+--- a/apps/documents/permissions/document_permissions.py
++++ b/apps/documents/permissions/document_permissions.py
+@@ -14,6 +14,9 @@ class IsCompanyDocumentUser(BasePermission):
+         "update": DocumentAccessPolicy.AccessLevel.EDIT,
+         "partial_update": DocumentAccessPolicy.AccessLevel.EDIT,
+         "destroy": DocumentAccessPolicy.AccessLevel.ADMIN,
++        "ai_library": DocumentAccessPolicy.AccessLevel.VIEW,
++        "preview": DocumentAccessPolicy.AccessLevel.VIEW,
++        "download": DocumentAccessPolicy.AccessLevel.VIEW,
+         "processing_jobs": DocumentAccessPolicy.AccessLevel.VIEW,
+         "retry_processing": DocumentAccessPolicy.AccessLevel.EDIT,
+         "access_policies": DocumentAccessPolicy.AccessLevel.ADMIN,
+diff --git a/apps/documents/serializers/__init__.py b/apps/documents/serializers/__init__.py
+index ca589d7..8158710 100644
+--- a/apps/documents/serializers/__init__.py
++++ b/apps/documents/serializers/__init__.py
+@@ -3,6 +3,7 @@ from .document_serializers import (
+     DocumentCreateSerializer,
+     DocumentDetailSerializer,
+     DocumentListSerializer,
++    InternalAIDocumentListSerializer,
+     DocumentProcessingJobSerializer,
+     DocumentTextExtractionSerializer,
+     DocumentUpdateSerializer,
+@@ -15,6 +16,7 @@ __all__ = [
+     "DocumentCreateSerializer",
+     "DocumentDetailSerializer",
+     "DocumentListSerializer",
++    "InternalAIDocumentListSerializer",
+     "DocumentProcessingJobSerializer",
+     "DocumentTextExtractionSerializer",
+     "DocumentUpdateSerializer",
+diff --git a/apps/documents/serializers/document_serializers.py b/apps/documents/serializers/document_serializers.py
+index e1e9287..161ec2a 100644
+--- a/apps/documents/serializers/document_serializers.py
++++ b/apps/documents/serializers/document_serializers.py
+@@ -1,4 +1,7 @@
++from pathlib import Path as FilePath
++
+ from rest_framework import serializers
++from rest_framework.reverse import reverse
+
+ from apps.data_firewall.models import FirewallScan
+ from apps.document_processing.models import DocumentTextExtraction
+@@ -174,6 +177,78 @@ class DocumentListSerializer(serializers.ModelSerializer):
+         return DocumentPermissionService.get_highest_access_level(request.user, obj)
+
+
++class InternalAIDocumentListSerializer(serializers.ModelSerializer):
++    department_uuid = serializers.UUIDField(
++        source="department.uuid",
++        read_only=True,
++        allow_null=True,
++    )
++    department_name = serializers.CharField(
++        source="department.name",
++        read_only=True,
++        allow_null=True,
++    )
++    file_extension = serializers.SerializerMethodField()
++    can_download = serializers.SerializerMethodField()
++    preview_url = serializers.SerializerMethodField()
++    download_url = serializers.SerializerMethodField()
++
++    class Meta:
++        model = Document
++        fields = [
++            "uuid",
++            "title",
++            "description",
++            "original_filename",
++            "file_extension",
++            "document_type",
++            "department_uuid",
++            "department_name",
++            "sensitivity_label",
++            "file_size",
++            "mime_type",
++            "page_count",
++            "status",
++            "is_indexed",
++            "is_ai_ready",
++            "can_download",
++            "preview_url",
++            "download_url",
++            "created_at",
++            "updated_at",
++        ]
++        read_only_fields = fields
++
++    def get_file_extension(self, obj):
++        return FilePath(obj.original_filename or "").suffix.lower()
++
++    def get_can_download(self, obj):
++        request = self.context.get("request")
++        if not request:
++            return False
++        return DocumentPermissionService.can_download_document(
++            request.user,
++            obj,
++            assume_view_access=bool(self.context.get("view_access_verified")),
++        )
++
++    def _build_url(self, obj, route_name):
++        request = self.context.get("request")
++        return reverse(
++            route_name,
++            kwargs={"uuid": obj.uuid},
++            request=request,
++        )
++
++    def get_preview_url(self, obj):
++        return self._build_url(obj, "documents-preview")
++
++    def get_download_url(self, obj):
++        if not self.get_can_download(obj):
++            return None
++        return self._build_url(obj, "documents-download")
++
++
+ class DocumentDetailSerializer(serializers.ModelSerializer):
+     company_name = serializers.CharField(source="company.name", read_only=True)
+     department_name = serializers.CharField(source="department.name", read_only=True)
+diff --git a/apps/documents/services/document_permission_service.py b/apps/documents/services/document_permission_service.py
+index 422625d..04be923 100644
+--- a/apps/documents/services/document_permission_service.py
++++ b/apps/documents/services/document_permission_service.py
+@@ -184,6 +184,52 @@ class DocumentPermissionService:
+             .exists()
+         )
+
++    @classmethod
++    def can_download_document(cls, user, document, assume_view_access=False):
++        if not document:
++            return False
++
++        if not assume_view_access and not cls.has_document_access(
++            user=user,
++            document=document,
++            required_access=DocumentAccessPolicy.AccessLevel.VIEW,
++        ):
++            return False
++
++        if cls.is_company_admin(user) or document.uploaded_by_id == getattr(
++            user, "id", None
++        ):
++            return True
++
++        prefetched = getattr(document, "_prefetched_objects_cache", {}).get(
++            "access_policies"
++        )
++
++        if prefetched is None:
++            policies = list(
++                DocumentAccessPolicy.objects.filter(
++                    document=document,
++                    is_deleted=False,
++                ).filter(Q(user=user) | Q(role=getattr(user, "role", "")))
++            )
++        else:
++            policies = [
++                policy
++                for policy in prefetched
++                if not policy.is_deleted
++                and (
++                    policy.user_id == getattr(user, "id", None)
++                    or (policy.role and policy.role == getattr(user, "role", ""))
++                )
++            ]
++
++        # Explicit document policy controls download when one applies. Department-
++        # based access falls back to view access when there is no explicit policy.
++        if policies:
++            return any(policy.can_download for policy in policies)
++
++        return True
++
+     @classmethod
+     def get_highest_access_level(cls, user, document):
+         if cls.is_company_admin(user):
+diff --git a/apps/documents/views/document_views.py b/apps/documents/views/document_views.py
+index 670394b..fbcd0e4 100644
+--- a/apps/documents/views/document_views.py
++++ b/apps/documents/views/document_views.py
+@@ -1,5 +1,8 @@
++from django.db.models import Q
++from django.http import FileResponse, Http404
+ from rest_framework import filters, status, viewsets
+ from rest_framework.decorators import action
++from rest_framework.pagination import PageNumberPagination
+ from rest_framework.parsers import FormParser, MultiPartParser
+ from rest_framework.response import Response
+
+@@ -10,6 +13,7 @@ from apps.documents.serializers import (
+     DocumentCreateSerializer,
+     DocumentDetailSerializer,
+     DocumentListSerializer,
++    InternalAIDocumentListSerializer,
+     DocumentProcessingJobSerializer,
+     DocumentUpdateSerializer,
+ )
+@@ -20,6 +24,29 @@ from apps.documents.services import (
+ from apps.documents.tasks import process_document_pipeline
+
+
++class InternalAIDocumentPagination(PageNumberPagination):
++    page_size = 25
++    page_size_query_param = "page_size"
++    max_page_size = 100
++
++
++def _secure_file_response(document, as_attachment):
++    try:
++        file_handle = document.file.open("rb")
++    except (FileNotFoundError, OSError, ValueError):
++        raise Http404("Document file is not available.")
++
++    response = FileResponse(
++        file_handle,
++        as_attachment=as_attachment,
++        filename=document.original_filename or document.title,
++        content_type=document.mime_type or "application/octet-stream",
++    )
++    response["Cache-Control"] = "private, no-store"
++    response["X-Content-Type-Options"] = "nosniff"
++    return response
++
++
+ class DocumentViewSet(viewsets.ModelViewSet):
+     permission_classes = [IsCompanyDocumentUser]
+     lookup_field = "uuid"
+@@ -127,6 +154,94 @@ class DocumentViewSet(viewsets.ModelViewSet):
+     def perform_destroy(self, instance):
+         instance.soft_delete()
+
++    @action(detail=False, methods=["get"], url_path="ai-library")
++    def ai_library(self, request):
++        queryset = (
++            DocumentPermissionService.get_accessible_document_queryset(
++                user=request.user,
++                required_access="view",
++                require_ai=True,
++                scope=Document.Scope.INTERNAL,
++            )
++            .filter(
++                status=Document.Status.READY,
++                is_ai_ready=True,
++                is_indexed=True,
++            )
++            .select_related("department", "uploaded_by")
++            .prefetch_related("access_policies")
++        )
++
++        search = (request.query_params.get("search") or "").strip()
++        if search:
++            queryset = queryset.filter(
++                Q(title__icontains=search)
++                | Q(description__icontains=search)
++                | Q(original_filename__icontains=search)
++                | Q(department__name__icontains=search)
++                | Q(document_type__icontains=search)
++            )
++
++        department = request.query_params.get("department")
++        document_type = request.query_params.get("document_type")
++        sensitivity_label = request.query_params.get("sensitivity_label")
++
++        if department:
++            queryset = queryset.filter(department__uuid=department)
++        if document_type:
++            queryset = queryset.filter(document_type=document_type)
++        if sensitivity_label:
++            queryset = queryset.filter(sensitivity_label=sensitivity_label)
++
++        ordering = request.query_params.get("ordering", "-updated_at")
++        allowed_ordering = {
++            "title",
++            "-title",
++            "created_at",
++            "-created_at",
++            "updated_at",
++            "-updated_at",
++            "file_size",
++            "-file_size",
++        }
++        if ordering not in allowed_ordering:
++            ordering = "-updated_at"
++
++        queryset = queryset.distinct().order_by(ordering)
++
++        paginator = InternalAIDocumentPagination()
++        page = paginator.paginate_queryset(queryset, request, view=self)
++        serializer = InternalAIDocumentListSerializer(
++            page,
++            many=True,
++            context={
++                **self.get_serializer_context(),
++                "view_access_verified": True,
++            },
++        )
++        return paginator.get_paginated_response(serializer.data)
++
++    @action(detail=True, methods=["get"], url_path="preview")
++    def preview(self, request, uuid=None):
++        document = self.get_object()
++        return _secure_file_response(document, as_attachment=False)
++
++    @action(detail=True, methods=["get"], url_path="download")
++    def download(self, request, uuid=None):
++        document = self.get_object()
++
++        if not DocumentPermissionService.can_download_document(
++            user=request.user,
++            document=document,
++            assume_view_access=True,
++        ):
++            return Response(
++                {"detail": "You do not have permission to download this document."},
++                status=status.HTTP_403_FORBIDDEN,
++            )
++
++        return _secure_file_response(document, as_attachment=True)
++
+     @action(detail=True, methods=["get"], url_path="processing-jobs")
+     def processing_jobs(self, request, uuid=None):
+         document = self.get_object()
+diff --git a/apps/vector_search/serializers/vector_search_serializers.py b/apps/vector_search/serializers/vector_search_serializers.py
+index 710bd77..91d3150 100644
+--- a/apps/vector_search/serializers/vector_search_serializers.py
++++ b/apps/vector_search/serializers/vector_search_serializers.py
+@@ -15,10 +15,13 @@ class VectorSearchResultSerializer(serializers.Serializer):
+     chunk_uuid = serializers.UUIDField()
+     document_uuid = serializers.UUIDField()
+     document_title = serializers.CharField()
++    document_filename = serializers.CharField()
++    document_mime_type = serializers.CharField(allow_blank=True)
+     department_uuid = serializers.UUIDField(allow_null=True)
+     department_name = serializers.CharField(allow_null=True)
+     document_type = serializers.CharField()
+     sensitivity_label = serializers.CharField()
++    page_number = serializers.IntegerField(allow_null=True)
+     chunk_index = serializers.IntegerField()
+     content = serializers.CharField()
+     score = serializers.FloatField()
+diff --git a/apps/vector_search/services/vector_search_service.py b/apps/vector_search/services/vector_search_service.py
+index 8646c39..ec8fac7 100644
+--- a/apps/vector_search/services/vector_search_service.py
++++ b/apps/vector_search/services/vector_search_service.py
+@@ -29,7 +29,9 @@ class VectorSearchService:
+                 company=company,
+                 is_deleted=False,
+                 document__is_deleted=False,
++                document__status=Document.Status.READY,
+                 document__is_ai_ready=True,
++                document__is_indexed=True,
+                 document__scope=scope,
+             )
+             .select_related("document", "department", "company")
+@@ -73,6 +75,8 @@ class VectorSearchService:
+                     "chunk_uuid": str(chunk.uuid),
+                     "document_uuid": str(chunk.document.uuid),
+                     "document_title": chunk.document.title,
++                    "document_filename": chunk.document.original_filename,
++                    "document_mime_type": chunk.document.mime_type,
+                     "document_scope": chunk.document.scope,
+                     "department_uuid": str(chunk.department.uuid)
+                     if chunk.department
+@@ -82,6 +86,7 @@ class VectorSearchService:
+                     else None,
+                     "document_type": chunk.document_type,
+                     "sensitivity_label": chunk.sensitivity_label,
++                    "page_number": chunk.page_number,
+                     "chunk_index": chunk.chunk_index,
+                     "content": chunk.content,
+                     "score": round(score, 4),

@@ -26,6 +26,17 @@ class Document(BaseModel):
         FAILED = "failed", "Failed"
         ARCHIVED = "archived", "Archived"
 
+    class ProcessingStage(models.TextChoices):
+        QUEUED = "queued", "Queued"
+        EXTRACTING = "extracting", "Extracting"
+        CLASSIFYING = "classifying", "Classifying"
+        FIREWALL_SCAN = "firewall_scan", "Firewall Scan"
+        CHUNKING = "chunking", "Chunking"
+        EMBEDDING = "embedding", "Embedding"
+        INDEXING = "indexing", "Indexing"
+        READY = "ready", "Ready"
+        FAILED = "failed", "Failed"
+
     class Scope(models.TextChoices):
         INTERNAL = "internal", "Internal"
         EXTERNAL = "external", "External"
@@ -104,6 +115,13 @@ class Document(BaseModel):
     is_ocr_completed = models.BooleanField(default=False)
     is_ai_ready = models.BooleanField(default=False)
 
+    processing_stage = models.CharField(
+        max_length=40,
+        choices=ProcessingStage.choices,
+        default=ProcessingStage.QUEUED,
+        db_index=True,
+    )
+    processing_progress = models.PositiveSmallIntegerField(default=0)
     processing_error = models.TextField(blank=True)
 
     def __str__(self):

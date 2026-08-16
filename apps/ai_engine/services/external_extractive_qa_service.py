@@ -107,7 +107,15 @@ class ExternalExtractiveQAService:
         )
 
         if explicit_document_uuids:
-            return list(queryset.filter(uuid__in=explicit_document_uuids))
+            return list(
+                queryset.filter(
+                    uuid__in=explicit_document_uuids,
+                    ai_conversation_attachments__conversation=conversation,
+                    ai_conversation_attachments__is_deleted=False,
+                )
+                .distinct()
+                .order_by("created_at")
+            )
 
         attached_document_ids = AIConversationDocument.objects.filter(
             company=user.company,

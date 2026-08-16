@@ -32,9 +32,9 @@ class LLMProviderConfigService:
                 name="Environment Ollama",
                 provider_type=LLMProviderConfig.ProviderType.OLLAMA,
                 endpoint_url=os.getenv("OLLAMA_BASE_URL", "http://ollama:11434"),
-                model_name=os.getenv("OLLAMA_DEFAULT_MODEL", "llama3.2:1b"),
-                max_tokens=1200,
-                temperature=0.2,
+                model_name=os.getenv("OLLAMA_DEFAULT_MODEL", "qwen3:8b"),
+                max_tokens=int(os.getenv("OLLAMA_DEFAULT_MAX_TOKENS", "600")),
+                temperature=float(os.getenv("OLLAMA_TEMPERATURE", "0.2")),
                 is_active=True,
                 is_default=True,
             )

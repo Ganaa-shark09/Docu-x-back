@@ -21,6 +21,9 @@ ALLOWED_HOSTS = env.list(
 )
 
 INSTALLED_APPS = [
+    # Daphne must be before django.contrib.staticfiles so its ASGI runserver wins.
+    "daphne",
+    "channels",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -51,6 +54,7 @@ INSTALLED_APPS = [
     "apps.integrations",
     "apps.billing",
     "apps.notifications",
+    "apps.realtime",
     "apps.shared",
 ]
 
@@ -84,6 +88,7 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = "config.wsgi.application"
+ASGI_APPLICATION = "config.realtime_asgi.application"
 
 DATABASES = {
     "default": {
@@ -160,6 +165,36 @@ CORS_ALLOWED_ORIGINS = env.list(
     default=["http://localhost:4200", "http://127.0.0.1:4200"],
 )
 
+WEBSOCKET_ALLOWED_ORIGINS = env.list(
+    "WEBSOCKET_ALLOWED_ORIGINS",
+    default=CORS_ALLOWED_ORIGINS,
+)
+WEBSOCKET_TICKET_MAX_AGE_SECONDS = env.int(
+    "WEBSOCKET_TICKET_MAX_AGE_SECONDS",
+    default=60,
+)
+WEBSOCKET_MAX_DOCUMENT_SUBSCRIPTIONS = env.int(
+    "WEBSOCKET_MAX_DOCUMENT_SUBSCRIPTIONS",
+    default=200,
+)
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_redis.core.RedisChannelLayer",
+        "CONFIG": {
+            # Keep realtime traffic isolated from Celery broker/result DBs.
+            "hosts": [
+                env(
+                    "CHANNEL_LAYER_REDIS_URL",
+                    default="redis://localhost:6379/2",
+                )
+            ],
+            "capacity": env.int("CHANNEL_LAYER_CAPACITY", default=1000),
+            "expiry": env.int("CHANNEL_LAYER_EXPIRY_SECONDS", default=60),
+        },
+    }
+}
+
 CELERY_BROKER_URL = env(
     "CELERY_BROKER_URL",
     default="redis://localhost:6379/0",
@@ -172,3 +207,13 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TIMEZONE = TIME_ZONE
+
+DOCUMENT_PROCESSING_QUEUE = env(
+    "DOCUMENT_PROCESSING_QUEUE",
+    default="document_processing",
+)
+CELERY_TASK_ROUTES = {
+    "apps.documents.tasks.document_processing_tasks.process_document_pipeline": {
+        "queue": DOCUMENT_PROCESSING_QUEUE,
+    },
+}

@@ -23,6 +23,7 @@ urlpatterns = [
     path("api/dashboard/", include("apps.shared.dashboard_urls")),
     path("api/vector-search/", include("apps.vector_search.urls")),
     path("api/ai/", include("apps.ai_engine.urls")),
+    path("api/realtime/", include("apps.realtime.urls")),
 ]
 
 if settings.DEBUG:

@@ -1,0 +1,1957 @@
+diff --git a/.env.example b/.env.example
+index 43224f1..12971c6 100644
+--- a/.env.example
++++ b/.env.example
+@@ -139,3 +139,11 @@ JWT_ACCESS_TOKEN_MINUTES=480
+ JWT_REFRESH_TOKEN_DAYS=30
+
+ DOCUX_AI_LOG_LEVEL=INFO
++
++# Realtime document processing over Django Channels.
++CHANNEL_LAYER_REDIS_URL=redis://redis:6379/2
++CHANNEL_LAYER_CAPACITY=1000
++CHANNEL_LAYER_EXPIRY_SECONDS=60
++WEBSOCKET_ALLOWED_ORIGINS=http://localhost:4200,http://127.0.0.1:4200
++WEBSOCKET_TICKET_MAX_AGE_SECONDS=60
++WEBSOCKET_MAX_DOCUMENT_SUBSCRIPTIONS=200
+diff --git a/apps/ai_engine/services/external_chat_service.py b/apps/ai_engine/services/external_chat_service.py
+index 49cb30f..dc0fbdd 100644
+--- a/apps/ai_engine/services/external_chat_service.py
++++ b/apps/ai_engine/services/external_chat_service.py
+@@ -215,6 +215,7 @@ class ExternalChatService:
+         top_k=8,
+         use_web=True,
+         document_uuids=None,
++        routing_plan=None,
+     ):
+         with transaction.atomic():
+             conversation = cls._get_or_create_conversation(
+@@ -227,6 +228,12 @@ class ExternalChatService:
+                 conversation=conversation,
+                 role=AIMessage.Role.USER,
+                 content=message,
++                metadata={
++                    "scope": Document.Scope.EXTERNAL,
++                    "requested_document_uuids": [
++                        str(item) for item in (document_uuids or [])
++                    ],
++                },
+             )
+
+         attached_document_uuids = cls._get_attached_document_uuids(conversation)
+@@ -251,7 +258,7 @@ class ExternalChatService:
+         # ---------------------------------------------------------
+         # Semantic planning + possible direct answer
+         # ---------------------------------------------------------
+-        plan = ExternalSemanticOrchestratorService.plan(
++        plan = routing_plan or ExternalSemanticOrchestratorService.plan(
+             message=message,
+             conversation=conversation,
+             current_user_message_uuid=user_message.uuid,
+diff --git a/apps/ai_engine/services/external_document_exact_answer_service.py b/apps/ai_engine/services/external_document_exact_answer_service.py
+index edddc55..5041c2d 100644
+--- a/apps/ai_engine/services/external_document_exact_answer_service.py
++++ b/apps/ai_engine/services/external_document_exact_answer_service.py
+@@ -161,7 +161,15 @@ class ExternalDocumentExactAnswerService:
+         ).exclude(status=Document.Status.FAILED)
+
+         if explicit_document_uuids:
+-            return list(queryset.filter(uuid__in=explicit_document_uuids))
++            return list(
++                queryset.filter(
++                    uuid__in=explicit_document_uuids,
++                    ai_conversation_attachments__conversation=conversation,
++                    ai_conversation_attachments__is_deleted=False,
++                )
++                .distinct()
++                .order_by("created_at")
++            )
+
+         attached_document_ids = AIConversationDocument.objects.filter(
+             company=user.company,
+diff --git a/apps/ai_engine/services/external_document_readiness_service.py b/apps/ai_engine/services/external_document_readiness_service.py
+index 882374d..27fe406 100644
+--- a/apps/ai_engine/services/external_document_readiness_service.py
++++ b/apps/ai_engine/services/external_document_readiness_service.py
+@@ -99,6 +99,8 @@ class ExternalDocumentReadinessService:
+             "original_filename": document.original_filename,
+             "status": document.status,
+             "state": state,
++            "processing_stage": document.processing_stage,
++            "processing_progress": int(document.processing_progress or 0),
+             "is_ai_ready": bool(document.is_ai_ready),
+             "is_ocr_completed": bool(document.is_ocr_completed),
+             "is_indexed": bool(document.is_indexed),
+diff --git a/apps/ai_engine/services/external_document_retrieval_service.py b/apps/ai_engine/services/external_document_retrieval_service.py
+index 6cec703..81b7263 100644
+--- a/apps/ai_engine/services/external_document_retrieval_service.py
++++ b/apps/ai_engine/services/external_document_retrieval_service.py
+@@ -126,7 +126,15 @@ class ExternalDocumentRetrievalService:
+         )
+
+         if explicit_document_uuids:
+-            return list(queryset.filter(uuid__in=explicit_document_uuids))
++            return list(
++                queryset.filter(
++                    uuid__in=explicit_document_uuids,
++                    ai_conversation_attachments__conversation=conversation,
++                    ai_conversation_attachments__is_deleted=False,
++                )
++                .distinct()
++                .order_by("created_at")
++            )
+
+         attached_document_ids = AIConversationDocument.objects.filter(
+             company=user.company,
+diff --git a/apps/ai_engine/services/external_extractive_qa_service.py b/apps/ai_engine/services/external_extractive_qa_service.py
+index 5d0f0d1..31b0e35 100644
+--- a/apps/ai_engine/services/external_extractive_qa_service.py
++++ b/apps/ai_engine/services/external_extractive_qa_service.py
+@@ -107,7 +107,15 @@ class ExternalExtractiveQAService:
+         )
+
+         if explicit_document_uuids:
+-            return list(queryset.filter(uuid__in=explicit_document_uuids))
++            return list(
++                queryset.filter(
++                    uuid__in=explicit_document_uuids,
++                    ai_conversation_attachments__conversation=conversation,
++                    ai_conversation_attachments__is_deleted=False,
++                )
++                .distinct()
++                .order_by("created_at")
++            )
+
+         attached_document_ids = AIConversationDocument.objects.filter(
+             company=user.company,
+diff --git a/apps/ai_engine/services/external_semantic_orchestrator_service.py b/apps/ai_engine/services/external_semantic_orchestrator_service.py
+index 7baccd9..74f469f 100644
+--- a/apps/ai_engine/services/external_semantic_orchestrator_service.py
++++ b/apps/ai_engine/services/external_semantic_orchestrator_service.py
+@@ -654,6 +654,17 @@ web={use_web}
+         for message in reversed(list(queryset)):
+             if message.role not in {"user", "assistant"}:
+                 continue
++
++            # Failed capability clarifications such as "I cannot access the
++            # screenshot" must never become evidence for a later routing turn.
++            # They can create a self-reinforcing loop where a now-ready attachment
++            # is repeatedly classified as unavailable.
++            if (
++                message.role == "assistant"
++                and (message.metadata or {}).get("semantic_action") == cls.ACTION_CLARIFY
++            ):
++                continue
++
+             history.append(
+                 {"role": message.role, "content": message.content[:500]}
+             )
+diff --git a/apps/ai_engine/tests/test_external_chat_readiness_routing.py b/apps/ai_engine/tests/test_external_chat_readiness_routing.py
+new file mode 100644
+index 0000000..7647d14
+--- /dev/null
++++ b/apps/ai_engine/tests/test_external_chat_readiness_routing.py
+@@ -0,0 +1,118 @@
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from rest_framework.test import APIRequestFactory, force_authenticate
++from django.test import SimpleTestCase
++
++from apps.ai_engine.views.external_ai_views import ExternalChatAPIView
++
++
++class ExternalChatReadinessRoutingTests(SimpleTestCase):
++    def setUp(self):
++        self.factory = APIRequestFactory()
++        self.user = SimpleNamespace(
++            is_authenticated=True,
++            company_id=1,
++            company=SimpleNamespace(pk=1),
++        )
++
++    @staticmethod
++    def _processing_readiness():
++        return {
++            "documents": [],
++            "ready_documents": [],
++            "processing_documents": [{"uuid": "doc-1"}],
++            "failed_documents": [],
++            "missing_document_uuids": [],
++            "all_ready": False,
++            "has_processing": True,
++            "has_failed": False,
++        }
++
++    @patch("apps.ai_engine.views.external_ai_views.ExternalChatService.chat")
++    @patch("apps.ai_engine.views.external_ai_views.ExternalSemanticOrchestratorService.plan")
++    @patch("apps.ai_engine.views.external_ai_views.ExternalDocumentReadinessService.inspect")
++    def test_unrelated_query_is_not_blocked_by_processing_documents(
++        self,
++        inspect,
++        plan,
++        chat,
++    ):
++        inspect.return_value = self._processing_readiness()
++        plan.return_value = {
++            "action": "direct",
++            "document_dependency": "none",
++            "answer_tier": "fast",
++            "fast_answer": "Hello.",
++        }
++        assistant = SimpleNamespace(
++            uuid="message-1",
++            content="Hello.",
++            model_provider="ollama",
++            model_name="qwen3:4b-instruct",
++            prompt_tokens=1,
++            completion_tokens=1,
++            total_tokens=2,
++        )
++        chat.return_value = {
++            "conversation": SimpleNamespace(uuid="conversation-1"),
++            "assistant_message": assistant,
++            "sources": [],
++            "external_chunks": [],
++            "web_results": [],
++            "processing_documents": [],
++            "failed_documents": [],
++            "search_warnings": [],
++            "intent": "general_question",
++        }
++
++        request = self.factory.post(
++            "/api/ai/external-chat/",
++            {
++                "message": "How are you?",
++                "document_uuids": ["doc-1"],
++            },
++            format="json",
++        )
++        force_authenticate(request, user=self.user)
++
++        response = ExternalChatAPIView.as_view()(request)
++
++        self.assertEqual(response.status_code, 200)
++        chat.assert_called_once()
++        self.assertEqual(
++            chat.call_args.kwargs["routing_plan"]["document_dependency"],
++            "none",
++        )
++
++    @patch("apps.ai_engine.views.external_ai_views.ExternalChatService.chat")
++    @patch("apps.ai_engine.views.external_ai_views.ExternalSemanticOrchestratorService.plan")
++    @patch("apps.ai_engine.views.external_ai_views.ExternalDocumentReadinessService.inspect")
++    def test_document_dependent_query_waits_for_processing_documents(
++        self,
++        inspect,
++        plan,
++        chat,
++    ):
++        inspect.return_value = self._processing_readiness()
++        plan.return_value = {
++            "action": "document",
++            "document_dependency": "required",
++            "document_task": "analyze",
++        }
++
++        request = self.factory.post(
++            "/api/ai/external-chat/",
++            {
++                "message": "Explain this screenshot",
++                "document_uuids": ["doc-1"],
++            },
++            format="json",
++        )
++        force_authenticate(request, user=self.user)
++
++        response = ExternalChatAPIView.as_view()(request)
++
++        self.assertEqual(response.status_code, 202)
++        self.assertEqual(response.data["status"], "attachments_processing")
++        chat.assert_not_called()
+diff --git a/apps/ai_engine/tests/test_external_semantic_orchestrator_history.py b/apps/ai_engine/tests/test_external_semantic_orchestrator_history.py
+new file mode 100644
+index 0000000..c8b5943
+--- /dev/null
++++ b/apps/ai_engine/tests/test_external_semantic_orchestrator_history.py
+@@ -0,0 +1,43 @@
++from django.contrib.auth import get_user_model
++from django.test import TestCase
++
++from apps.ai_engine.models import AIConversation, AIMessage
++from apps.ai_engine.services.external_semantic_orchestrator_service import (
++    ExternalSemanticOrchestratorService,
++)
++from apps.tenants.models import Company
++
++
++class ExternalSemanticOrchestratorHistoryTests(TestCase):
++    def test_failed_clarification_assistant_message_is_not_reused_as_routing_history(self):
++        company = Company.objects.create(name="History Co", slug="history-co")
++        user = get_user_model().objects.create_user(
++            username="history-user",
++            password="test-password",
++            company=company,
++        )
++        conversation = AIConversation.objects.create(
++            company=company,
++            user=user,
++            scope=AIConversation.Scope.EXTERNAL,
++            title="Screenshot chat",
++        )
++
++        AIMessage.objects.create(
++            conversation=conversation,
++            role=AIMessage.Role.USER,
++            content="Please explain this screenshot",
++        )
++        AIMessage.objects.create(
++            conversation=conversation,
++            role=AIMessage.Role.ASSISTANT,
++            content="I cannot see or access the screenshot.",
++            metadata={"semantic_action": "clarify"},
++        )
++
++        history = ExternalSemanticOrchestratorService._build_history(conversation)
++
++        self.assertEqual(
++            history,
++            [{"role": "user", "content": "Please explain this screenshot"}],
++        )
+diff --git a/apps/ai_engine/views/external_ai_views.py b/apps/ai_engine/views/external_ai_views.py
+index fed8da2..a4dd6ab 100644
+--- a/apps/ai_engine/views/external_ai_views.py
++++ b/apps/ai_engine/views/external_ai_views.py
+@@ -5,10 +5,14 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+ from rest_framework.response import Response
+ from rest_framework.views import APIView
+
++from apps.ai_engine.models import AIConversation
+ from apps.ai_engine.services import ExternalChatService
+ from apps.ai_engine.services.external_document_readiness_service import (
+     ExternalDocumentReadinessService,
+ )
++from apps.ai_engine.services.external_semantic_orchestrator_service import (
++    ExternalSemanticOrchestratorService,
++)
+ from apps.documents.models import Document
+ from apps.documents.serializers.external_document_serializers import (
+     ExternalDocumentSerializer,
+@@ -49,10 +53,15 @@ class ExternalChatAPIView(APIView):
+             else str(use_web_value).strip().lower() in {"true", "1", "yes"}
+         )
+
+-        # Message-scoped attachments are authoritative. Never invoke routing or
+-        # an LLM while a file explicitly attached to this message is still being
+-        # processed; otherwise the assistant can incorrectly behave as if the
+-        # attachment was never supplied.
++        routing_plan = None
++
++        # The frontend may send either the specifically selected documents or all
++        # documents currently attached to the conversation. Document readiness
++        # must therefore not block an unrelated general query. We always validate
++        # ownership/conversation membership first, but only gate on processing or
++        # failure when semantic routing says the request actually requires document
++        # content. The WebSocket normally prevents this race; this remains the
++        # authoritative backend safety net.
+         if document_uuids:
+             readiness = ExternalDocumentReadinessService.inspect(
+                 user=request.user,
+@@ -70,27 +79,57 @@ class ExternalChatAPIView(APIView):
+                     status=status.HTTP_400_BAD_REQUEST,
+                 )
+
+-            if readiness["has_failed"]:
+-                return Response(
+-                    {
+-                        "status": "attachment_processing_failed",
+-                        "detail": "One or more attached files failed processing.",
+-                        **readiness,
+-                    },
+-                    status=status.HTTP_409_CONFLICT,
++            if readiness["has_processing"] or readiness["has_failed"]:
++                conversation = None
++                if conversation_uuid:
++                    conversation = AIConversation.objects.filter(
++                        uuid=conversation_uuid,
++                        company=request.user.company,
++                        user=request.user,
++                        scope=AIConversation.Scope.EXTERNAL,
++                        is_deleted=False,
++                    ).first()
++
++                routing_plan = ExternalSemanticOrchestratorService.plan(
++                    message=message,
++                    conversation=conversation,
++                    has_attached_documents=bool(document_uuids),
++                    has_explicit_documents=bool(document_uuids),
++                    use_web=use_web,
+                 )
+
+-            if readiness["has_processing"] or not readiness["all_ready"]:
+-                return Response(
+-                    {
+-                        "status": "attachments_processing",
+-                        "detail": "The attached files are still being processed.",
+-                        "retry_after_ms": 3000,
+-                        **readiness,
+-                    },
+-                    status=status.HTTP_202_ACCEPTED,
++                requires_documents = (
++                    routing_plan.get("document_dependency")
++                    == ExternalSemanticOrchestratorService.DOCUMENT_DEPENDENCY_REQUIRED
++                    or routing_plan.get("action")
++                    in {
++                        ExternalSemanticOrchestratorService.ACTION_DOCUMENT,
++                        ExternalSemanticOrchestratorService.ACTION_DOCUMENT_WEB,
++                    }
+                 )
+
++                if requires_documents and readiness["has_failed"]:
++                    return Response(
++                        {
++                            "status": "attachment_processing_failed",
++                            "detail": "One or more documents required for this query failed processing.",
++                            **readiness,
++                        },
++                        status=status.HTTP_409_CONFLICT,
++                    )
++
++                if requires_documents and (
++                    readiness["has_processing"] or not readiness["all_ready"]
++                ):
++                    return Response(
++                        {
++                            "status": "attachments_processing",
++                            "detail": "The documents required for this query are still being processed.",
++                            **readiness,
++                        },
++                        status=status.HTTP_202_ACCEPTED,
++                    )
++
+         result = ExternalChatService.chat(
+             user=request.user,
+             message=message,
+@@ -98,6 +137,7 @@ class ExternalChatAPIView(APIView):
+             top_k=int(request.data.get("top_k", 8)),
+             use_web=use_web,
+             document_uuids=document_uuids,
++            routing_plan=routing_plan,
+         )
+
+         assistant_message = result["assistant_message"]
+@@ -117,6 +157,7 @@ class ExternalChatAPIView(APIView):
+                 },
+                 "external_context": {
+                     "intent": result.get("intent"),
++                    "requested_document_uuids": document_uuids or [],
+                     "external_chunk_count": len(result["external_chunks"]),
+                     "web_result_count": len(result["web_results"]),
+                     "processing_documents": result.get("processing_documents", []),
+diff --git a/apps/documents/admin/document_admin.py b/apps/documents/admin/document_admin.py
+index 96acaf8..7a0238a 100644
+--- a/apps/documents/admin/document_admin.py
++++ b/apps/documents/admin/document_admin.py
+@@ -35,6 +35,8 @@ class DocumentAdmin(admin.ModelAdmin):
+         "document_type",
+         "sensitivity_label",
+         "status",
++        "processing_stage",
++        "processing_progress",
+         "is_ai_ready",
+         "created_at",
+     )
+@@ -42,6 +44,7 @@ class DocumentAdmin(admin.ModelAdmin):
+         "document_type",
+         "sensitivity_label",
+         "status",
++        "processing_stage",
+         "is_indexed",
+         "is_ocr_completed",
+         "is_ai_ready",
+diff --git a/apps/documents/migrations/0003_document_processing_stage.py b/apps/documents/migrations/0003_document_processing_stage.py
+new file mode 100644
+index 0000000..85ab9fc
+--- /dev/null
++++ b/apps/documents/migrations/0003_document_processing_stage.py
+@@ -0,0 +1,63 @@
++from django.db import migrations, models
++
++
++def backfill_processing_state(apps, schema_editor):
++    Document = apps.get_model("documents", "Document")
++
++    Document.objects.filter(status="ready").update(
++        processing_stage="ready",
++        processing_progress=100,
++    )
++    Document.objects.filter(status="failed").update(
++        processing_stage="failed",
++    )
++    Document.objects.filter(status="archived", is_ai_ready=True).update(
++        processing_stage="ready",
++        processing_progress=100,
++    )
++    Document.objects.filter(status="processing").update(
++        processing_stage="extracting",
++        processing_progress=10,
++    )
++    Document.objects.filter(status="uploaded").update(
++        processing_stage="queued",
++        processing_progress=0,
++    )
++
++
++class Migration(migrations.Migration):
++    dependencies = [
++        ("documents", "0002_document_scope_and_more"),
++    ]
++
++    operations = [
++        migrations.AddField(
++            model_name="document",
++            name="processing_stage",
++            field=models.CharField(
++                choices=[
++                    ("queued", "Queued"),
++                    ("extracting", "Extracting"),
++                    ("classifying", "Classifying"),
++                    ("firewall_scan", "Firewall Scan"),
++                    ("chunking", "Chunking"),
++                    ("embedding", "Embedding"),
++                    ("indexing", "Indexing"),
++                    ("ready", "Ready"),
++                    ("failed", "Failed"),
++                ],
++                db_index=True,
++                default="queued",
++                max_length=40,
++            ),
++        ),
++        migrations.AddField(
++            model_name="document",
++            name="processing_progress",
++            field=models.PositiveSmallIntegerField(default=0),
++        ),
++        migrations.RunPython(
++            backfill_processing_state,
++            reverse_code=migrations.RunPython.noop,
++        ),
++    ]
+diff --git a/apps/documents/models/document.py b/apps/documents/models/document.py
+index 79798d9..4e6a3ec 100644
+--- a/apps/documents/models/document.py
++++ b/apps/documents/models/document.py
+@@ -26,6 +26,18 @@ class Document(BaseModel):
+         FAILED = "failed", "Failed"
+         ARCHIVED = "archived", "Archived"
+
++
++    class ProcessingStage(models.TextChoices):
++        QUEUED = "queued", "Queued"
++        EXTRACTING = "extracting", "Extracting"
++        CLASSIFYING = "classifying", "Classifying"
++        FIREWALL_SCAN = "firewall_scan", "Firewall Scan"
++        CHUNKING = "chunking", "Chunking"
++        EMBEDDING = "embedding", "Embedding"
++        INDEXING = "indexing", "Indexing"
++        READY = "ready", "Ready"
++        FAILED = "failed", "Failed"
++
+     class Scope(models.TextChoices):
+         INTERNAL = "internal", "Internal"
+         EXTERNAL = "external", "External"
+@@ -104,6 +116,13 @@ class Document(BaseModel):
+     is_ocr_completed = models.BooleanField(default=False)
+     is_ai_ready = models.BooleanField(default=False)
+
++    processing_stage = models.CharField(
++        max_length=40,
++        choices=ProcessingStage.choices,
++        default=ProcessingStage.QUEUED,
++        db_index=True,
++    )
++    processing_progress = models.PositiveSmallIntegerField(default=0)
+     processing_error = models.TextField(blank=True)
+
+     def __str__(self):
+diff --git a/apps/documents/serializers/document_serializers.py b/apps/documents/serializers/document_serializers.py
+index e8caa42..53bf2d0 100644
+--- a/apps/documents/serializers/document_serializers.py
++++ b/apps/documents/serializers/document_serializers.py
+@@ -154,6 +154,8 @@ class DocumentListSerializer(serializers.ModelSerializer):
+             "current_user_access",
+             "document_type",
+             "status",
++            "processing_stage",
++            "processing_progress",
+             "sensitivity_label",
+             "original_filename",
+             "file_size",
+@@ -209,6 +211,8 @@ class InternalAIDocumentListSerializer(serializers.ModelSerializer):
+             "mime_type",
+             "page_count",
+             "status",
++            "processing_stage",
++            "processing_progress",
+             "is_indexed",
+             "is_ai_ready",
+             "can_download",
+@@ -275,6 +279,8 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
+             "current_user_access",
+             "document_type",
+             "status",
++            "processing_stage",
++            "processing_progress",
+             "sensitivity_label",
+             "original_filename",
+             "file",
+@@ -302,6 +308,8 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
+             "uploaded_by_email",
+             "current_user_access",
+             "status",
++            "processing_stage",
++            "processing_progress",
+             "original_filename",
+             "file_size",
+             "mime_type",
+diff --git a/apps/documents/serializers/external_document_serializers.py b/apps/documents/serializers/external_document_serializers.py
+index 0b90f5b..ba66ace 100644
+--- a/apps/documents/serializers/external_document_serializers.py
++++ b/apps/documents/serializers/external_document_serializers.py
+@@ -27,6 +27,8 @@ class ExternalDocumentSerializer(serializers.ModelSerializer):
+             "file_size",
+             "mime_type",
+             "status",
++            "processing_stage",
++            "processing_progress",
+             "is_ocr_completed",
+             "is_indexed",
+             "is_ai_ready",
+diff --git a/apps/documents/services/__init__.py b/apps/documents/services/__init__.py
+index c6486a7..1d97aab 100644
+--- a/apps/documents/services/__init__.py
++++ b/apps/documents/services/__init__.py
+@@ -1,9 +1,11 @@
+ from .document_permission_service import DocumentPermissionService
++from .document_processing_event_service import DocumentProcessingEventService
+ from .document_processing_job_service import DocumentProcessingJobService
+ from .file_validation_service import DocumentFileValidationService
+
+ __all__ = [
+     "DocumentFileValidationService",
+     "DocumentPermissionService",
++    "DocumentProcessingEventService",
+     "DocumentProcessingJobService",
+ ]
+diff --git a/apps/documents/services/document_processing_event_service.py b/apps/documents/services/document_processing_event_service.py
+new file mode 100644
+index 0000000..6d90861
+--- /dev/null
++++ b/apps/documents/services/document_processing_event_service.py
+@@ -0,0 +1,140 @@
++import logging
++import uuid
++
++from asgiref.sync import async_to_sync
++from channels.layers import get_channel_layer
++from django.db import transaction
++from django.utils import timezone
++
++from apps.documents.models import Document
++
++logger = logging.getLogger(__name__)
++
++
++class DocumentProcessingEventService:
++    EVENT_VERSION = 1
++
++    @staticmethod
++    def group_name(document_uuid):
++        return f"document.{document_uuid}"
++
++    @classmethod
++    def transition(
++        cls,
++        document,
++        *,
++        stage,
++        progress=None,
++        status=None,
++        message="",
++        error=None,
++        extra=None,
++        publish=True,
++    ):
++        if stage not in Document.ProcessingStage.values:
++            raise ValueError(f"Unsupported document processing stage: {stage}")
++
++        update_fields = ["processing_stage", "updated_at"]
++        document.processing_stage = stage
++
++        if progress is not None:
++            document.processing_progress = max(0, min(100, int(progress)))
++            update_fields.append("processing_progress")
++
++        if status is not None:
++            document.status = status
++            update_fields.append("status")
++        elif stage == Document.ProcessingStage.READY:
++            document.status = Document.Status.READY
++            update_fields.append("status")
++        elif stage == Document.ProcessingStage.FAILED:
++            document.status = Document.Status.FAILED
++            update_fields.append("status")
++        elif stage != Document.ProcessingStage.QUEUED:
++            document.status = Document.Status.PROCESSING
++            update_fields.append("status")
++
++        if error is not None:
++            document.processing_error = str(error)
++            update_fields.append("processing_error")
++        elif stage != Document.ProcessingStage.FAILED and document.processing_error:
++            document.processing_error = ""
++            update_fields.append("processing_error")
++
++        # Avoid duplicate update_fields when a caller supplied overlapping state.
++        document.save(update_fields=list(dict.fromkeys(update_fields)))
++
++        payload = cls.snapshot_payload(
++            document,
++            event="document.processing.updated",
++            message=message,
++            extra=extra,
++        )
++
++        if publish:
++            transaction.on_commit(lambda: cls.publish_payload(document.uuid, payload))
++
++        return payload
++
++    @classmethod
++    def snapshot_payload(cls, document, *, event, message="", extra=None):
++        return {
++            "event": event,
++            "event_version": cls.EVENT_VERSION,
++            "event_id": str(uuid.uuid4()),
++            "document_uuid": str(document.uuid),
++            "scope": document.scope,
++            "stage": document.processing_stage,
++            "status": document.status,
++            "progress": int(document.processing_progress or 0),
++            "is_ai_ready": bool(document.is_ai_ready),
++            "is_ocr_completed": bool(document.is_ocr_completed),
++            "is_indexed": bool(document.is_indexed),
++            "message": message or cls.stage_message(document.processing_stage),
++            "error": document.processing_error or None,
++            "updated_at": document.updated_at.isoformat() if document.updated_at else None,
++            "occurred_at": timezone.now().isoformat(),
++            "extra": extra or {},
++        }
++
++    @classmethod
++    def publish_payload(cls, document_uuid, payload):
++        channel_layer = get_channel_layer()
++        if channel_layer is None:
++            logger.warning(
++                "document_processing_event_skipped document=%s reason=no_channel_layer",
++                document_uuid,
++            )
++            return
++
++        try:
++            async_to_sync(channel_layer.group_send)(
++                cls.group_name(document_uuid),
++                {
++                    "type": "document_processing_update",
++                    "payload": payload,
++                },
++            )
++        except Exception:
++            # Realtime delivery is best-effort. Database state is authoritative and
++            # document processing must never fail because a browser or Redis channel
++            # layer is temporarily unavailable.
++            logger.exception(
++                "document_processing_event_publish_failed document=%s stage=%s",
++                document_uuid,
++                payload.get("stage"),
++            )
++
++    @staticmethod
++    def stage_message(stage):
++        return {
++            Document.ProcessingStage.QUEUED: "Queued for processing",
++            Document.ProcessingStage.EXTRACTING: "Extracting document text",
++            Document.ProcessingStage.CLASSIFYING: "Classifying document",
++            Document.ProcessingStage.FIREWALL_SCAN: "Running data firewall checks",
++            Document.ProcessingStage.CHUNKING: "Creating document chunks",
++            Document.ProcessingStage.EMBEDDING: "Creating embeddings",
++            Document.ProcessingStage.INDEXING: "Indexing document",
++            Document.ProcessingStage.READY: "Document is ready for AI",
++            Document.ProcessingStage.FAILED: "Document processing failed",
++        }.get(stage, "Document processing updated")
+diff --git a/apps/documents/tasks/document_processing_tasks.py b/apps/documents/tasks/document_processing_tasks.py
+index a51c790..6338d62 100644
+--- a/apps/documents/tasks/document_processing_tasks.py
++++ b/apps/documents/tasks/document_processing_tasks.py
+@@ -7,6 +7,7 @@ from apps.document_processing.services import (
+     TextExtractionService,
+ )
+ from apps.documents.models import Document, DocumentProcessingJob
++from apps.documents.services import DocumentProcessingEventService
+ from apps.vector_search.services import VectorIndexingService
+
+
+@@ -28,12 +29,14 @@ def _mark_job_running(document, job_type):
+
+     job.status = DocumentProcessingJob.Status.RUNNING
+     job.started_at = timezone.now()
++    job.completed_at = None
+     job.error_message = ""
+     job.progress_percent = 10
+     job.save(
+         update_fields=[
+             "status",
+             "started_at",
++            "completed_at",
+             "error_message",
+             "progress_percent",
+             "updated_at",
+@@ -44,6 +47,9 @@ def _mark_job_running(document, job_type):
+
+
+ def _mark_job_success(job, output_payload=None):
++    if not job or job.status == DocumentProcessingJob.Status.SUCCESS:
++        return
++
+     job.status = DocumentProcessingJob.Status.SUCCESS
+     job.completed_at = timezone.now()
+     job.progress_percent = 100
+@@ -60,6 +66,9 @@ def _mark_job_success(job, output_payload=None):
+
+
+ def _mark_job_failed(job, error):
++    if not job:
++        return
++
+     job.status = DocumentProcessingJob.Status.FAILED
+     job.completed_at = timezone.now()
+     job.progress_percent = 100
+@@ -79,9 +88,15 @@ def _mark_job_failed(job, error):
+ def process_document_pipeline(self, document_uuid):
+     document = Document.objects.get(uuid=document_uuid)
+
+-    document.status = Document.Status.PROCESSING
++    document.is_ai_ready = False
+     document.processing_error = ""
+-    document.save(update_fields=["status", "processing_error", "updated_at"])
++    document.save(
++        update_fields=[
++            "is_ai_ready",
++            "processing_error",
++            "updated_at",
++        ]
++    )
+
+     try:
+         extraction_result = run_text_extraction(document.uuid)
+@@ -92,23 +107,39 @@ def process_document_pipeline(self, document_uuid):
+         document.refresh_from_db()
+
+         document.is_ai_ready = bool(document.is_ocr_completed and document.is_indexed)
+-        document.status = (
+-            Document.Status.READY if document.is_ai_ready else Document.Status.FAILED
+-        )
+
+         if not document.is_ai_ready:
+             document.processing_error = (
+                 "Document processing completed, but document is not AI ready."
+             )
+-
+-        document.save(
+-            update_fields=[
+-                "is_ai_ready",
+-                "status",
+-                "processing_error",
+-                "updated_at",
+-            ]
+-        )
++            document.save(
++                update_fields=[
++                    "is_ai_ready",
++                    "processing_error",
++                    "updated_at",
++                ]
++            )
++            DocumentProcessingEventService.transition(
++                document,
++                stage=Document.ProcessingStage.FAILED,
++                error=document.processing_error,
++                message="Document processing completed but the document is not AI ready",
++            )
++        else:
++            document.processing_error = ""
++            document.save(
++                update_fields=[
++                    "is_ai_ready",
++                    "processing_error",
++                    "updated_at",
++                ]
++            )
++            DocumentProcessingEventService.transition(
++                document,
++                stage=Document.ProcessingStage.READY,
++                progress=100,
++                message="Document is ready for AI",
++            )
+
+         return {
+             "document_uuid": str(document.uuid),
+@@ -117,17 +148,28 @@ def process_document_pipeline(self, document_uuid):
+             "firewall": firewall_result,
+             "indexing": indexing_result,
+             "status": document.status,
++            "processing_stage": document.processing_stage,
+         }
+
+     except Exception as exc:
+-        document.status = Document.Status.FAILED
+-        document.processing_error = str(exc)
+-        document.save(update_fields=["status", "processing_error", "updated_at"])
++        document.refresh_from_db()
++        DocumentProcessingEventService.transition(
++            document,
++            stage=Document.ProcessingStage.FAILED,
++            error=exc,
++            message="Document processing failed",
++        )
+         raise self.retry(exc=exc, countdown=10)
+
+
+ def run_text_extraction(document_uuid):
+     document = Document.objects.get(uuid=document_uuid)
++    DocumentProcessingEventService.transition(
++        document,
++        stage=Document.ProcessingStage.EXTRACTING,
++        progress=10,
++        message="Extracting document text",
++    )
+
+     job = _mark_job_running(document, DocumentProcessingJob.JobType.OCR)
+
+@@ -153,6 +195,12 @@ def run_text_extraction(document_uuid):
+
+ def run_document_classification(document_uuid):
+     document = Document.objects.get(uuid=document_uuid)
++    DocumentProcessingEventService.transition(
++        document,
++        stage=Document.ProcessingStage.CLASSIFYING,
++        progress=35,
++        message="Classifying document",
++    )
+
+     job = _mark_job_running(document, DocumentProcessingJob.JobType.CLASSIFICATION)
+
+@@ -168,6 +216,12 @@ def run_document_classification(document_uuid):
+
+ def run_firewall_scan(document_uuid):
+     document = Document.objects.get(uuid=document_uuid)
++    DocumentProcessingEventService.transition(
++        document,
++        stage=Document.ProcessingStage.FIREWALL_SCAN,
++        progress=45,
++        message="Running data firewall checks",
++    )
+
+     job = _mark_job_running(document, DocumentProcessingJob.JobType.FIREWALL_SCAN)
+
+@@ -194,32 +248,106 @@ def run_firewall_scan(document_uuid):
+ def run_vector_indexing(document_uuid):
+     document = Document.objects.get(uuid=document_uuid)
+
+-    chunking_job = _mark_job_running(document, DocumentProcessingJob.JobType.CHUNKING)
+-    embedding_job = _mark_job_running(document, DocumentProcessingJob.JobType.EMBEDDING)
+-    indexing_job = _mark_job_running(document, DocumentProcessingJob.JobType.INDEXING)
++    jobs = {
++        "chunking": _mark_job_running(
++            document,
++            DocumentProcessingJob.JobType.CHUNKING,
++        ),
++        "embedding": None,
++        "indexing": None,
++    }
++    stage_metadata = {}
++
++    DocumentProcessingEventService.transition(
++        document,
++        stage=Document.ProcessingStage.CHUNKING,
++        progress=55,
++        message="Creating document chunks",
++    )
++
++    def progress_callback(stage, metadata):
++        nonlocal jobs, stage_metadata
++        metadata = metadata or {}
++        stage_metadata[stage] = metadata
++
++        if stage == "chunking":
++            # The CHUNKING stage was emitted immediately before indexing work
++            # started. Keep the computed chunk count for job output without
++            # sending a duplicate stage event.
++            return
++
++        if stage == "embedding":
++            _mark_job_success(
++                jobs["chunking"],
++                stage_metadata.get("chunking", {}),
++            )
++            jobs["embedding"] = jobs["embedding"] or _mark_job_running(
++                document,
++                DocumentProcessingJob.JobType.EMBEDDING,
++            )
++            DocumentProcessingEventService.transition(
++                document,
++                stage=Document.ProcessingStage.EMBEDDING,
++                progress=70,
++                message="Creating embeddings",
++                extra=metadata,
++            )
++            return
++
++        if stage == "indexing":
++            _mark_job_success(
++                jobs["embedding"],
++                stage_metadata.get("embedding", {}),
++            )
++            jobs["indexing"] = jobs["indexing"] or _mark_job_running(
++                document,
++                DocumentProcessingJob.JobType.INDEXING,
++            )
++            DocumentProcessingEventService.transition(
++                document,
++                stage=Document.ProcessingStage.INDEXING,
++                progress=90,
++                message="Indexing document",
++                extra=metadata,
++            )
+
+     try:
+-        result = VectorIndexingService.index_document(document)
++        result = VectorIndexingService.index_document(
++            document,
++            progress_callback=progress_callback,
++        )
+
++        # Handle providers/edge cases that return before one of the normal
++        # callbacks so processing-job state still reaches a terminal state.
+         _mark_job_success(
+-            chunking_job,
+-            {
+-                "chunk_count": result.get("chunk_count", 0),
+-            },
++            jobs["chunking"],
++            stage_metadata.get("chunking", {"chunk_count": result.get("chunk_count", 0)}),
+         )
++
++        if jobs["embedding"] is None:
++            jobs["embedding"] = _mark_job_running(
++                document,
++                DocumentProcessingJob.JobType.EMBEDDING,
++            )
+         _mark_job_success(
+-            embedding_job,
++            jobs["embedding"],
+             {
+                 "embedding_provider": result.get("embedding_provider"),
+                 "embedding_dimensions": result.get("embedding_dimensions"),
+             },
+         )
+-        _mark_job_success(indexing_job, result)
++
++        if jobs["indexing"] is None:
++            jobs["indexing"] = _mark_job_running(
++                document,
++                DocumentProcessingJob.JobType.INDEXING,
++            )
++        _mark_job_success(jobs["indexing"], result)
+
+         return result
+
+     except Exception as exc:
+-        _mark_job_failed(chunking_job, exc)
+-        _mark_job_failed(embedding_job, exc)
+-        _mark_job_failed(indexing_job, exc)
++        _mark_job_failed(jobs.get("chunking"), exc)
++        _mark_job_failed(jobs.get("embedding"), exc)
++        _mark_job_failed(jobs.get("indexing"), exc)
+         raise
+diff --git a/apps/documents/tests/test_document_processing_event_service.py b/apps/documents/tests/test_document_processing_event_service.py
+new file mode 100644
+index 0000000..6c469b8
+--- /dev/null
++++ b/apps/documents/tests/test_document_processing_event_service.py
+@@ -0,0 +1,62 @@
++from unittest.mock import patch
++
++from django.test import TestCase
++
++from apps.documents.models import Document
++from apps.documents.services.document_processing_event_service import (
++    DocumentProcessingEventService,
++)
++from apps.tenants.models import Company
++
++
++class DocumentProcessingEventServiceTests(TestCase):
++    def setUp(self):
++        self.company = Company.objects.create(name="Realtime Co", slug="realtime-co")
++        self.document = Document.objects.create(
++            company=self.company,
++            title="policy.pdf",
++            original_filename="policy.pdf",
++            scope=Document.Scope.INTERNAL,
++        )
++
++    @patch.object(DocumentProcessingEventService, "publish_payload")
++    def test_transition_persists_state_before_publishing(self, publish_payload):
++        with self.captureOnCommitCallbacks(execute=True):
++            payload = DocumentProcessingEventService.transition(
++                self.document,
++                stage=Document.ProcessingStage.EMBEDDING,
++                progress=70,
++                message="Creating embeddings",
++            )
++
++        self.document.refresh_from_db()
++        self.assertEqual(self.document.status, Document.Status.PROCESSING)
++        self.assertEqual(
++            self.document.processing_stage,
++            Document.ProcessingStage.EMBEDDING,
++        )
++        self.assertEqual(self.document.processing_progress, 70)
++        self.assertEqual(payload["event"], "document.processing.updated")
++        self.assertEqual(payload["document_uuid"], str(self.document.uuid))
++        publish_payload.assert_called_once()
++
++    @patch.object(DocumentProcessingEventService, "publish_payload")
++    def test_ready_transition_sets_terminal_state(self, publish_payload):
++        self.document.is_ai_ready = True
++        self.document.is_indexed = True
++        self.document.is_ocr_completed = True
++        self.document.save()
++
++        with self.captureOnCommitCallbacks(execute=True):
++            payload = DocumentProcessingEventService.transition(
++                self.document,
++                stage=Document.ProcessingStage.READY,
++                progress=100,
++            )
++
++        self.document.refresh_from_db()
++        self.assertEqual(self.document.status, Document.Status.READY)
++        self.assertEqual(self.document.processing_stage, Document.ProcessingStage.READY)
++        self.assertEqual(self.document.processing_progress, 100)
++        self.assertTrue(payload["is_ai_ready"])
++        publish_payload.assert_called_once()
+diff --git a/apps/documents/views/document_views.py b/apps/documents/views/document_views.py
+index 9328bb2..0d0287b 100644
+--- a/apps/documents/views/document_views.py
++++ b/apps/documents/views/document_views.py
+@@ -19,6 +19,7 @@ from apps.documents.serializers import (
+ )
+ from apps.documents.services import (
+     DocumentPermissionService,
++    DocumentProcessingEventService,
+     DocumentProcessingJobService,
+ )
+ from apps.documents.tasks import process_document_pipeline
+@@ -270,6 +271,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
+         DocumentProcessingJobService.create_default_jobs_for_document(document)
+
+         document.status = Document.Status.UPLOADED
++        document.processing_stage = Document.ProcessingStage.QUEUED
++        document.processing_progress = 0
+         document.processing_error = ""
+         document.is_ocr_completed = False
+         document.is_ai_ready = False
+@@ -277,6 +280,8 @@ class DocumentViewSet(viewsets.ModelViewSet):
+         document.save(
+             update_fields=[
+                 "status",
++                "processing_stage",
++                "processing_progress",
+                 "processing_error",
+                 "is_ocr_completed",
+                 "is_ai_ready",
+@@ -285,6 +290,14 @@ class DocumentViewSet(viewsets.ModelViewSet):
+             ]
+         )
+
++        DocumentProcessingEventService.transition(
++            document,
++            stage=Document.ProcessingStage.QUEUED,
++            progress=0,
++            status=Document.Status.UPLOADED,
++            message="Queued for processing",
++        )
++
+         process_document_pipeline.delay(str(document.uuid))
+
+         return Response(
+diff --git a/apps/realtime/__init__.py b/apps/realtime/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/apps/realtime/apps.py b/apps/realtime/apps.py
+new file mode 100644
+index 0000000..081948a
+--- /dev/null
++++ b/apps/realtime/apps.py
+@@ -0,0 +1,7 @@
++from django.apps import AppConfig
++
++
++class RealtimeConfig(AppConfig):
++    default_auto_field = "django.db.models.BigAutoField"
++    name = "apps.realtime"
++    verbose_name = "Realtime"
+diff --git a/apps/realtime/auth.py b/apps/realtime/auth.py
+new file mode 100644
+index 0000000..94e0666
+--- /dev/null
++++ b/apps/realtime/auth.py
+@@ -0,0 +1,56 @@
++from urllib.parse import parse_qs
++
++from channels.db import database_sync_to_async
++from django.contrib.auth import get_user_model
++from django.contrib.auth.models import AnonymousUser
++from django.core import signing
++
++from apps.realtime.tickets import WebSocketTicketService
++
++
++class WebSocketTicketAuthMiddleware:
++    """Authenticate browser WebSockets with a short-lived signed ticket.
++
++    Native browser WebSocket clients cannot attach the normal Bearer header used
++    by the REST API. The frontend first obtains a short-lived ticket over the
++    authenticated HTTP API and then uses only that ticket during the handshake.
++    """
++
++    def __init__(self, inner):
++        self.inner = inner
++
++    async def __call__(self, scope, receive, send):
++        scope = dict(scope)
++        scope["user"] = AnonymousUser()
++
++        raw_query = scope.get("query_string", b"").decode("utf-8", errors="ignore")
++        ticket = (parse_qs(raw_query).get("ticket") or [""])[0]
++
++        if ticket:
++            try:
++                payload = WebSocketTicketService.verify(ticket)
++                scope["user"] = await self._load_user(payload)
++            except (signing.BadSignature, signing.SignatureExpired, ValueError, TypeError):
++                scope["user"] = AnonymousUser()
++
++        return await self.inner(scope, receive, send)
++
++    @staticmethod
++    @database_sync_to_async
++    def _load_user(payload):
++        user_id = payload.get("user_id")
++        company_uuid = payload.get("company_uuid")
++        if not user_id or not company_uuid:
++            return AnonymousUser()
++
++        User = get_user_model()
++        user = (
++            User.objects.select_related("company")
++            .filter(
++                pk=user_id,
++                company__uuid=company_uuid,
++                is_active=True,
++            )
++            .first()
++        )
++        return user or AnonymousUser()
+diff --git a/apps/realtime/consumers.py b/apps/realtime/consumers.py
+new file mode 100644
+index 0000000..d80eeba
+--- /dev/null
++++ b/apps/realtime/consumers.py
+@@ -0,0 +1,184 @@
++import uuid
++
++from channels.db import database_sync_to_async
++from channels.generic.websocket import AsyncJsonWebsocketConsumer
++from django.conf import settings
++
++from apps.documents.models import Document
++from apps.documents.services import DocumentPermissionService
++from apps.documents.services.document_processing_event_service import (
++    DocumentProcessingEventService,
++)
++
++
++class DocumentEventsConsumer(AsyncJsonWebsocketConsumer):
++    """One authenticated socket that can subscribe to many authorized documents."""
++
++    async def connect(self):
++        user = self.scope.get("user")
++        if not user or not user.is_authenticated or not getattr(user, "company_id", None):
++            await self.close(code=4401)
++            return
++
++        self.document_groups = set()
++        await self.accept()
++        await self.send_json(
++            {
++                "event": "connection.ready",
++                "event_version": 1,
++                "max_document_subscriptions": getattr(
++                    settings,
++                    "WEBSOCKET_MAX_DOCUMENT_SUBSCRIPTIONS",
++                    200,
++                ),
++            }
++        )
++
++    async def disconnect(self, close_code):
++        for group_name in list(getattr(self, "document_groups", set())):
++            await self.channel_layer.group_discard(group_name, self.channel_name)
++        self.document_groups = set()
++
++    async def receive_json(self, content, **kwargs):
++        action = str(content.get("action") or "").strip().lower()
++
++        if action == "ping":
++            await self.send_json({"event": "pong", "event_version": 1})
++            return
++
++        if action == "subscribe":
++            await self._subscribe(content.get("document_uuids"))
++            return
++
++        if action == "unsubscribe":
++            await self._unsubscribe(content.get("document_uuids"))
++            return
++
++        await self.send_json(
++            {
++                "event": "error",
++                "event_version": 1,
++                "code": "unsupported_action",
++                "detail": "Supported actions are subscribe, unsubscribe, and ping.",
++            }
++        )
++
++    async def _subscribe(self, raw_uuids):
++        requested, invalid = self._normalize_uuids(raw_uuids)
++        if not requested:
++            await self.send_json(
++                {
++                    "event": "subscription.updated",
++                    "event_version": 1,
++                    "subscribed_document_uuids": [],
++                    "rejected_document_uuids": invalid,
++                }
++            )
++            return
++
++        maximum = getattr(settings, "WEBSOCKET_MAX_DOCUMENT_SUBSCRIPTIONS", 200)
++        already_subscribed = [
++            item
++            for item in requested
++            if DocumentProcessingEventService.group_name(item) in self.document_groups
++        ]
++        new_requests = [item for item in requested if item not in already_subscribed]
++        available_slots = max(0, maximum - len(self.document_groups))
++        accepted_new = new_requests[:available_slots]
++        overflow = new_requests[available_slots:]
++        limited = already_subscribed + accepted_new
++
++        documents = await self._authorized_documents(limited)
++        authorized = {str(document.uuid): document for document in documents}
++
++        subscribed = []
++        rejected = invalid + [item for item in limited if item not in authorized] + overflow
++
++        for document_uuid in limited:
++            document = authorized.get(document_uuid)
++            if not document:
++                continue
++
++            group_name = DocumentProcessingEventService.group_name(document_uuid)
++            if group_name not in self.document_groups:
++                await self.channel_layer.group_add(group_name, self.channel_name)
++                self.document_groups.add(group_name)
++
++            subscribed.append(document_uuid)
++            # A snapshot closes the race between upload/processing and subscription,
++            # and also restores authoritative state after reconnect.
++            await self.send_json(
++                DocumentProcessingEventService.snapshot_payload(
++                    document,
++                    event="document.processing.snapshot",
++                )
++            )
++
++        await self.send_json(
++            {
++                "event": "subscription.updated",
++                "event_version": 1,
++                "subscribed_document_uuids": subscribed,
++                "rejected_document_uuids": rejected,
++            }
++        )
++
++    async def _unsubscribe(self, raw_uuids):
++        requested, invalid = self._normalize_uuids(raw_uuids)
++        removed = []
++
++        for document_uuid in requested:
++            group_name = DocumentProcessingEventService.group_name(document_uuid)
++            if group_name not in self.document_groups:
++                continue
++            await self.channel_layer.group_discard(group_name, self.channel_name)
++            self.document_groups.discard(group_name)
++            removed.append(document_uuid)
++
++        await self.send_json(
++            {
++                "event": "subscription.updated",
++                "event_version": 1,
++                "unsubscribed_document_uuids": removed,
++                "rejected_document_uuids": invalid,
++            }
++        )
++
++    async def document_processing_update(self, event):
++        await self.send_json(event["payload"])
++
++    @database_sync_to_async
++    def _authorized_documents(self, document_uuids):
++        return list(
++            DocumentPermissionService.get_accessible_document_queryset(
++                user=self.scope["user"],
++                required_access="view",
++            )
++            .filter(uuid__in=document_uuids)
++            .select_related("company", "department", "uploaded_by")
++            .distinct()
++        )
++
++    @staticmethod
++    def _normalize_uuids(raw_uuids):
++        if not raw_uuids:
++            return [], []
++        if isinstance(raw_uuids, str):
++            raw_uuids = [raw_uuids]
++
++        normalized = []
++        invalid = []
++        seen = set()
++        for value in raw_uuids:
++            raw_value = str(value or "").strip()
++            try:
++                item = str(uuid.UUID(raw_value))
++            except (ValueError, TypeError, AttributeError):
++                if raw_value and raw_value not in invalid:
++                    invalid.append(raw_value)
++                continue
++            if item in seen:
++                continue
++            seen.add(item)
++            normalized.append(item)
++        return normalized, invalid
+diff --git a/apps/realtime/routing.py b/apps/realtime/routing.py
+new file mode 100644
+index 0000000..5b8054e
+--- /dev/null
++++ b/apps/realtime/routing.py
+@@ -0,0 +1,8 @@
++from django.urls import path
++
++from apps.realtime.consumers import DocumentEventsConsumer
++
++
++websocket_urlpatterns = [
++    path("ws/document-events/", DocumentEventsConsumer.as_asgi()),
++]
+diff --git a/apps/realtime/tests/__init__.py b/apps/realtime/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/apps/realtime/tests/test_document_events_consumer.py b/apps/realtime/tests/test_document_events_consumer.py
+new file mode 100644
+index 0000000..37c4587
+--- /dev/null
++++ b/apps/realtime/tests/test_document_events_consumer.py
+@@ -0,0 +1,133 @@
++from asgiref.sync import async_to_sync
++from channels.layers import get_channel_layer
++from channels.routing import URLRouter
++from channels.security.websocket import OriginValidator
++from channels.testing import WebsocketCommunicator
++from django.contrib.auth import get_user_model
++from django.test import TransactionTestCase, override_settings
++
++from apps.documents.models import Document
++from apps.realtime.auth import WebSocketTicketAuthMiddleware
++from apps.realtime.routing import websocket_urlpatterns
++from apps.realtime.tickets import WebSocketTicketService
++from apps.tenants.models import Company
++
++
++@override_settings(
++    CHANNEL_LAYERS={
++        "default": {
++            "BACKEND": "channels.layers.InMemoryChannelLayer",
++        }
++    },
++    WEBSOCKET_MAX_DOCUMENT_SUBSCRIPTIONS=10,
++)
++class DocumentEventsConsumerTests(TransactionTestCase):
++    reset_sequences = True
++
++    def setUp(self):
++        self.company = Company.objects.create(name="Realtime Co", slug="realtime-ws-co")
++        self.other_company = Company.objects.create(
++            name="Other Co",
++            slug="other-realtime-ws-co",
++        )
++        User = get_user_model()
++        self.user = User.objects.create_user(
++            username="ws-user",
++            password="test-password",
++            company=self.company,
++        )
++        self.document = Document.objects.create(
++            company=self.company,
++            uploaded_by=self.user,
++            title="allowed.pdf",
++            original_filename="allowed.pdf",
++            scope=Document.Scope.INTERNAL,
++        )
++        self.other_document = Document.objects.create(
++            company=self.other_company,
++            title="blocked.pdf",
++            original_filename="blocked.pdf",
++            scope=Document.Scope.INTERNAL,
++        )
++
++    def test_subscription_is_permission_checked_and_returns_snapshot(self):
++        async_to_sync(self._run_subscription_scenario)()
++
++    async def _run_subscription_scenario(self):
++        application = OriginValidator(
++            WebSocketTicketAuthMiddleware(URLRouter(websocket_urlpatterns)),
++            ["http://localhost:4200"],
++        )
++        ticket = WebSocketTicketService.issue(self.user)
++        communicator = WebsocketCommunicator(
++            application,
++            f"/ws/document-events/?ticket={ticket}",
++            headers=[(b"origin", b"http://localhost:4200")],
++        )
++
++        connected, _ = await communicator.connect()
++        self.assertTrue(connected)
++
++        ready = await communicator.receive_json_from()
++        self.assertEqual(ready["event"], "connection.ready")
++
++        await communicator.send_json_to(
++            {
++                "action": "subscribe",
++                "document_uuids": [
++                    str(self.document.uuid),
++                    str(self.other_document.uuid),
++                ],
++            }
++        )
++
++        snapshot = await communicator.receive_json_from()
++        self.assertEqual(snapshot["event"], "document.processing.snapshot")
++        self.assertEqual(snapshot["document_uuid"], str(self.document.uuid))
++
++        subscription = await communicator.receive_json_from()
++        self.assertEqual(subscription["event"], "subscription.updated")
++        self.assertEqual(
++            subscription["subscribed_document_uuids"],
++            [str(self.document.uuid)],
++        )
++        self.assertEqual(
++            subscription["rejected_document_uuids"],
++            [str(self.other_document.uuid)],
++        )
++
++        channel_layer = get_channel_layer()
++        await channel_layer.group_send(
++            f"document.{self.document.uuid}",
++            {
++                "type": "document_processing_update",
++                "payload": {
++                    "event": "document.processing.updated",
++                    "event_version": 1,
++                    "document_uuid": str(self.document.uuid),
++                    "stage": "embedding",
++                    "status": "processing",
++                    "progress": 70,
++                },
++            },
++        )
++        update = await communicator.receive_json_from()
++        self.assertEqual(update["event"], "document.processing.updated")
++        self.assertEqual(update["document_uuid"], str(self.document.uuid))
++        self.assertEqual(update["stage"], "embedding")
++        self.assertEqual(update["progress"], 70)
++
++        await communicator.send_json_to(
++            {
++                "action": "subscribe",
++                "document_uuids": ["not-a-uuid"],
++            }
++        )
++        invalid_subscription = await communicator.receive_json_from()
++        self.assertEqual(invalid_subscription["event"], "subscription.updated")
++        self.assertEqual(
++            invalid_subscription["rejected_document_uuids"],
++            ["not-a-uuid"],
++        )
++
++        await communicator.disconnect()
+diff --git a/apps/realtime/tests/test_websocket_ticket_service.py b/apps/realtime/tests/test_websocket_ticket_service.py
+new file mode 100644
+index 0000000..48a5437
+--- /dev/null
++++ b/apps/realtime/tests/test_websocket_ticket_service.py
+@@ -0,0 +1,24 @@
++from django.contrib.auth import get_user_model
++from django.test import TestCase
++
++from apps.realtime.tickets import WebSocketTicketService
++from apps.tenants.models import Company
++
++
++class WebSocketTicketServiceTests(TestCase):
++    def test_ticket_contains_only_short_lived_identity_reference(self):
++        company = Company.objects.create(name="Realtime Co", slug="realtime-ticket-co")
++        user = get_user_model().objects.create_user(
++            username="realtime-user",
++            email="realtime@example.com",
++            password="test-password",
++            company=company,
++        )
++
++        ticket = WebSocketTicketService.issue(user)
++        payload = WebSocketTicketService.verify(ticket)
++
++        self.assertEqual(payload["user_id"], user.pk)
++        self.assertEqual(payload["company_uuid"], str(company.uuid))
++        self.assertNotIn("password", payload)
++        self.assertNotIn("access_token", payload)
+diff --git a/apps/realtime/tickets.py b/apps/realtime/tickets.py
+new file mode 100644
+index 0000000..7819100
+--- /dev/null
++++ b/apps/realtime/tickets.py
+@@ -0,0 +1,23 @@
++from django.conf import settings
++from django.core import signing
++
++
++class WebSocketTicketService:
++    SALT = "docux.websocket.ticket.v1"
++
++    @classmethod
++    def issue(cls, user):
++        payload = {
++            "user_id": user.pk,
++            "company_uuid": str(user.company.uuid),
++        }
++        signer = signing.TimestampSigner(salt=cls.SALT)
++        return signer.sign_object(payload, compress=True)
++
++    @classmethod
++    def verify(cls, ticket):
++        signer = signing.TimestampSigner(salt=cls.SALT)
++        return signer.unsign_object(
++            ticket,
++            max_age=getattr(settings, "WEBSOCKET_TICKET_MAX_AGE_SECONDS", 60),
++        )
+diff --git a/apps/realtime/urls.py b/apps/realtime/urls.py
+new file mode 100644
+index 0000000..c21427e
+--- /dev/null
++++ b/apps/realtime/urls.py
+@@ -0,0 +1,12 @@
++from django.urls import path
++
++from apps.realtime.views import WebSocketTicketView
++
++
++urlpatterns = [
++    path(
++        "websocket-ticket/",
++        WebSocketTicketView.as_view(),
++        name="realtime-websocket-ticket",
++    ),
++]
+diff --git a/apps/realtime/views.py b/apps/realtime/views.py
+new file mode 100644
+index 0000000..740ed34
+--- /dev/null
++++ b/apps/realtime/views.py
+@@ -0,0 +1,26 @@
++from django.conf import settings
++from rest_framework import permissions, status
++from rest_framework.response import Response
++from rest_framework.views import APIView
++
++from apps.realtime.tickets import WebSocketTicketService
++
++
++class WebSocketTicketView(APIView):
++    permission_classes = [permissions.IsAuthenticated]
++
++    def post(self, request):
++        if not getattr(request.user, "company_id", None):
++            return Response(
++                {"detail": "User is not assigned to a company."},
++                status=status.HTTP_403_FORBIDDEN,
++            )
++
++        return Response(
++            {
++                "ticket": WebSocketTicketService.issue(request.user),
++                "expires_in_seconds": settings.WEBSOCKET_TICKET_MAX_AGE_SECONDS,
++                "websocket_path": "/ws/document-events/",
++            },
++            status=status.HTTP_200_OK,
++        )
+diff --git a/apps/vector_search/services/vector_indexing_service.py b/apps/vector_search/services/vector_indexing_service.py
+index a093889..44f8b8b 100644
+--- a/apps/vector_search/services/vector_indexing_service.py
++++ b/apps/vector_search/services/vector_indexing_service.py
+@@ -7,8 +7,12 @@ from apps.vector_search.services.embedding_provider import EmbeddingProviderFact
+
+ class VectorIndexingService:
+     @classmethod
+-    @transaction.atomic
+-    def index_document(cls, document, provider_name="local_hashing"):
++    def index_document(
++        cls,
++        document,
++        provider_name="local_hashing",
++        progress_callback=None,
++    ):
+         extraction = getattr(document, "text_extraction", None)
+
+         if not extraction or not extraction.extracted_text.strip():
+@@ -21,10 +25,28 @@ class VectorIndexingService:
+         provider = EmbeddingProviderFactory.get_provider(provider_name)
+         chunks = ChunkingService.chunk_text(extraction.extracted_text)
+
+-        DocumentChunk.objects.filter(document=document).delete()
++        if progress_callback:
++            progress_callback(
++                "chunking",
++                {
++                    "chunk_count": len(chunks),
++                },
++            )
+
+         chunk_objects = []
+
++        if progress_callback:
++            progress_callback(
++                "embedding",
++                {
++                    "chunk_count": len(chunks),
++                    "embedding_provider": provider.provider_name,
++                    "embedding_dimensions": provider.dimensions,
++                },
++            )
++
++        # Embedding work can be CPU/network-heavy. Do it before opening the DB
++        # transaction so document indexing does not hold a long transaction open.
+         for index, chunk in enumerate(chunks):
+             embedding = provider.embed_text(chunk["content"])
+
+@@ -49,10 +71,22 @@ class VectorIndexingService:
+                 )
+             )
+
+-        DocumentChunk.objects.bulk_create(chunk_objects)
++        if progress_callback:
++            progress_callback(
++                "indexing",
++                {
++                    "chunk_count": len(chunk_objects),
++                    "embedding_provider": provider.provider_name,
++                    "embedding_dimensions": provider.dimensions,
++                },
++            )
++
++        with transaction.atomic():
++            DocumentChunk.objects.filter(document=document).delete()
++            DocumentChunk.objects.bulk_create(chunk_objects)
+
+-        document.is_indexed = bool(chunk_objects)
+-        document.save(update_fields=["is_indexed", "updated_at"])
++            document.is_indexed = bool(chunk_objects)
++            document.save(update_fields=["is_indexed", "updated_at"])
+
+         return {
+             "indexed": bool(chunk_objects),
+diff --git a/config/realtime_asgi.py b/config/realtime_asgi.py
+new file mode 100644
+index 0000000..6f0efe7
+--- /dev/null
++++ b/config/realtime_asgi.py
+@@ -0,0 +1,26 @@
++import os
++
++os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.local")
++
++from django.core.asgi import get_asgi_application  # noqa: E402
++
++# Initialize Django before importing application code that may touch ORM models.
++django_asgi_app = get_asgi_application()
++
++from channels.routing import ProtocolTypeRouter, URLRouter  # noqa: E402
++from channels.security.websocket import OriginValidator  # noqa: E402
++from django.conf import settings  # noqa: E402
++
++from apps.realtime.auth import WebSocketTicketAuthMiddleware  # noqa: E402
++from apps.realtime.routing import websocket_urlpatterns  # noqa: E402
++
++
++application = ProtocolTypeRouter(
++    {
++        "http": django_asgi_app,
++        "websocket": OriginValidator(
++            WebSocketTicketAuthMiddleware(URLRouter(websocket_urlpatterns)),
++            settings.WEBSOCKET_ALLOWED_ORIGINS,
++        ),
++    }
++)
+diff --git a/config/settings/base.py b/config/settings/base.py
+index 8f78768..4ab2730 100644
+--- a/config/settings/base.py
++++ b/config/settings/base.py
+@@ -21,6 +21,9 @@ ALLOWED_HOSTS = env.list(
+ )
+
+ INSTALLED_APPS = [
++    # Daphne must be before django.contrib.staticfiles so its ASGI runserver wins.
++    "daphne",
++    "channels",
+     "django.contrib.admin",
+     "django.contrib.auth",
+     "django.contrib.contenttypes",
+@@ -51,6 +54,7 @@ INSTALLED_APPS = [
+     "apps.integrations",
+     "apps.billing",
+     "apps.notifications",
++    "apps.realtime",
+     "apps.shared",
+ ]
+
+@@ -84,6 +88,7 @@ TEMPLATES = [
+ ]
+
+ WSGI_APPLICATION = "config.wsgi.application"
++ASGI_APPLICATION = "config.realtime_asgi.application"
+
+ DATABASES = {
+     "default": {
+@@ -160,6 +165,36 @@ CORS_ALLOWED_ORIGINS = env.list(
+     default=["http://localhost:4200", "http://127.0.0.1:4200"],
+ )
+
++WEBSOCKET_ALLOWED_ORIGINS = env.list(
++    "WEBSOCKET_ALLOWED_ORIGINS",
++    default=CORS_ALLOWED_ORIGINS,
++)
++WEBSOCKET_TICKET_MAX_AGE_SECONDS = env.int(
++    "WEBSOCKET_TICKET_MAX_AGE_SECONDS",
++    default=60,
++)
++WEBSOCKET_MAX_DOCUMENT_SUBSCRIPTIONS = env.int(
++    "WEBSOCKET_MAX_DOCUMENT_SUBSCRIPTIONS",
++    default=200,
++)
++
++CHANNEL_LAYERS = {
++    "default": {
++        "BACKEND": "channels_redis.core.RedisChannelLayer",
++        "CONFIG": {
++            # Keep realtime traffic isolated from Celery broker/result DBs.
++            "hosts": [
++                env(
++                    "CHANNEL_LAYER_REDIS_URL",
++                    default="redis://localhost:6379/2",
++                )
++            ],
++            "capacity": env.int("CHANNEL_LAYER_CAPACITY", default=1000),
++            "expiry": env.int("CHANNEL_LAYER_EXPIRY_SECONDS", default=60),
++        },
++    }
++}
++
+ CELERY_BROKER_URL = env(
+     "CELERY_BROKER_URL",
+     default="redis://localhost:6379/0",
+diff --git a/config/settings/local.py b/config/settings/local.py
+index bdf18e2..84b9a46 100644
+--- a/config/settings/local.py
++++ b/config/settings/local.py
+@@ -27,5 +27,15 @@ LOGGING = {
+             "level": DOCUX_AI_LOG_LEVEL,
+             "propagate": False,
+         },
++        "apps.documents": {
++            "handlers": ["console"],
++            "level": DOCUX_AI_LOG_LEVEL,
++            "propagate": False,
++        },
++        "apps.realtime": {
++            "handlers": ["console"],
++            "level": DOCUX_AI_LOG_LEVEL,
++            "propagate": False,
++        },
+     },
+ }
+diff --git a/config/urls.py b/config/urls.py
+index 756321c..9398077 100644
+--- a/config/urls.py
++++ b/config/urls.py
+@@ -23,6 +23,7 @@ urlpatterns = [
+     path("api/dashboard/", include("apps.shared.dashboard_urls")),
+     path("api/vector-search/", include("apps.vector_search.urls")),
+     path("api/ai/", include("apps.ai_engine.urls")),
++    path("api/realtime/", include("apps.realtime.urls")),
+ ]
+
+ if settings.DEBUG:
+diff --git a/envs/local/django.env b/envs/local/django.env
+index 197d7a0..bb533d4 100644
+--- a/envs/local/django.env
++++ b/envs/local/django.env
+@@ -121,3 +121,12 @@ JWT_ACCESS_TOKEN_MINUTES=480
+ JWT_REFRESH_TOKEN_DAYS=30
+
+ DOCUX_AI_LOG_LEVEL=INFO
++
++# Realtime document processing over Django Channels.
++# Redis DB 2 is intentionally separate from Celery broker (0) and result backend (1).
++CHANNEL_LAYER_REDIS_URL=redis://redis:6379/2
++CHANNEL_LAYER_CAPACITY=1000
++CHANNEL_LAYER_EXPIRY_SECONDS=60
++WEBSOCKET_ALLOWED_ORIGINS=http://localhost:4200,http://127.0.0.1:4200
++WEBSOCKET_TICKET_MAX_AGE_SECONDS=60
++WEBSOCKET_MAX_DOCUMENT_SUBSCRIPTIONS=200

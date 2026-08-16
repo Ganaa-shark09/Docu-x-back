@@ -1,6 +1,9 @@
 from django.db import transaction
 
 from apps.ai_engine.models import AIConversation, AIMessage
+from apps.ai_engine.services.internal_document_scope_service import (
+    InternalDocumentScopeService,
+)
 from apps.ai_engine.services.llm_gateway_service import LLMGatewayService
 from apps.ai_engine.services.llm_provider_config_service import LLMProviderConfigService
 from apps.ai_engine.services.prompt_builder_service import PromptBuilderService
@@ -21,11 +24,23 @@ class RAGChatService:
         department_uuid=None,
         document_type=None,
         sensitivity_label=None,
+        document_scope=InternalDocumentScopeService.ALL,
+        document_uuids=None,
         top_k=5,
         scope=Document.Scope.INTERNAL,
         ip_address=None,
         user_agent="",
     ):
+        if scope != Document.Scope.INTERNAL:
+            raise ValueError("RAGChatService only supports Internal AI document scope.")
+
+        resolved_document_scope = InternalDocumentScopeService.resolve(
+            user=user,
+            document_scope=document_scope,
+            document_uuids=document_uuids,
+        )
+        document_scope_metadata = resolved_document_scope.as_metadata()
+
         conversation = cls._get_or_create_conversation(
             user=user,
             message=message,
@@ -38,6 +53,9 @@ class RAGChatService:
             conversation=conversation,
             role=AIMessage.Role.USER,
             content=message,
+            metadata={
+                "document_scope": document_scope_metadata,
+            },
         )
 
         retrieved_chunks = VectorSearchService.search(
@@ -49,6 +67,7 @@ class RAGChatService:
             sensitivity_label=sensitivity_label,
             top_k=top_k,
             scope=scope,
+            document_uuids=resolved_document_scope.search_document_uuids,
         )
 
         requested_provider_config = (
@@ -67,6 +86,8 @@ class RAGChatService:
         prompt = PromptBuilderService.build_rag_prompt(
             user_question=message,
             retrieved_chunks=safe_chunks,
+            document_scope=resolved_document_scope.mode,
+            selected_document_titles=resolved_document_scope.document_titles,
         )
 
         if not safe_chunks and enforcement_result.get("blocked_count", 0) > 0:
@@ -108,6 +129,7 @@ class RAGChatService:
                 "document_type": document_type,
                 "sensitivity_label": sensitivity_label,
                 "department_uuid": str(department_uuid) if department_uuid else None,
+                "document_scope": document_scope_metadata,
                 "user_message_uuid": str(user_message.uuid),
                 "llm_metadata": llm_result.get("metadata", {}),
                 "firewall_enforcement": {
@@ -145,6 +167,7 @@ class RAGChatService:
             "user_message": user_message,
             "assistant_message": assistant_message,
             "sources": assistant_message.retrieved_sources,
+            "document_context": document_scope_metadata,
             "firewall": {
                 "requested_provider_type": enforcement_result.get(
                     "requested_provider_type"
@@ -209,8 +232,11 @@ class RAGChatService:
                     "chunk_uuid": chunk.get("chunk_uuid"),
                     "document_uuid": chunk.get("document_uuid"),
                     "document_title": chunk.get("document_title"),
+                    "document_filename": chunk.get("document_filename"),
+                    "document_mime_type": chunk.get("document_mime_type"),
                     "department_uuid": chunk.get("department_uuid"),
                     "department_name": chunk.get("department_name"),
+                    "page_number": chunk.get("page_number"),
                     "chunk_index": chunk.get("chunk_index"),
                     "score": chunk.get("score"),
                     "distance": chunk.get("distance"),

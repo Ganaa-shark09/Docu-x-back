@@ -35,6 +35,8 @@ class DocumentAdmin(admin.ModelAdmin):
         "document_type",
         "sensitivity_label",
         "status",
+        "processing_stage",
+        "processing_progress",
         "is_ai_ready",
         "created_at",
     )
@@ -42,6 +44,7 @@ class DocumentAdmin(admin.ModelAdmin):
         "document_type",
         "sensitivity_label",
         "status",
+        "processing_stage",
         "is_indexed",
         "is_ocr_completed",
         "is_ai_ready",

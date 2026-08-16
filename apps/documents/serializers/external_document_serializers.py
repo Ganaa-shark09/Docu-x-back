@@ -27,6 +27,8 @@ class ExternalDocumentSerializer(serializers.ModelSerializer):
             "file_size",
             "mime_type",
             "status",
+            "processing_stage",
+            "processing_progress",
             "is_ocr_completed",
             "is_indexed",
             "is_ai_ready",

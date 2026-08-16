@@ -9,38 +9,6 @@ from apps.documents.models import Document
 class ExternalDocumentRetrievalService:
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".tif"}
 
-    DOCUMENT_QUERY_HINTS = {
-        "document",
-        "file",
-        "uploaded",
-        "attached",
-        "attachment",
-        "screenshot",
-        "image",
-        "photo",
-        "picture",
-        "screen",
-        "ocr",
-        "visible",
-        "content",
-        "summarize",
-        "summary",
-        "describe",
-        "read",
-        "turn",
-        "prompt",
-        "message",
-        "instruction",
-        "modal",
-        "dialog",
-        "field",
-        "button",
-        "invoice",
-        "contract",
-        "payment",
-        "term",
-    }
-
     @classmethod
     def retrieve(
         cls,
@@ -49,6 +17,7 @@ class ExternalDocumentRetrievalService:
         query,
         explicit_document_uuids=None,
         top_k=12,
+        document_required=False,
     ):
         documents = cls.get_candidate_documents(
             user=user,
@@ -74,7 +43,10 @@ class ExternalDocumentRetrievalService:
             if document.status == Document.Status.FAILED
         ]
 
-        document_query = cls.looks_like_document_query(query)
+        # The semantic orchestrator owns query-to-document routing. Retrieval
+        # receives that decision explicitly instead of reclassifying the user's
+        # wording with phrase lists or regex shortcuts.
+        document_query = bool(document_required)
         chunks = []
 
         for document in ready_documents:
@@ -126,7 +98,15 @@ class ExternalDocumentRetrievalService:
         )
 
         if explicit_document_uuids:
-            return list(queryset.filter(uuid__in=explicit_document_uuids))
+            return list(
+                queryset.filter(
+                    uuid__in=explicit_document_uuids,
+                    ai_conversation_attachments__conversation=conversation,
+                    ai_conversation_attachments__is_deleted=False,
+                )
+                .distinct()
+                .order_by("created_at")
+            )
 
         attached_document_ids = AIConversationDocument.objects.filter(
             company=user.company,
@@ -188,11 +168,11 @@ class ExternalDocumentRetrievalService:
                     "document_scope": document.scope,
                     "chunk_index": 0,
                     "content": content,
+                    "source_preview": normalized_text[:1600],
                     "score": cls.score_chunk(
                         query=query,
                         document=document,
                         chunk_text=content,
-                        is_image=is_image,
                         document_query=document_query,
                     ),
                     "metadata": {
@@ -223,11 +203,11 @@ class ExternalDocumentRetrievalService:
                     "document_scope": document.scope,
                     "chunk_index": index,
                     "content": content,
+                    "source_preview": chunk_text[:1600],
                     "score": cls.score_chunk(
                         query=query,
                         document=document,
                         chunk_text=content,
-                        is_image=is_image,
                         document_query=document_query,
                     ),
                     "metadata": {
@@ -314,9 +294,7 @@ class ExternalDocumentRetrievalService:
         return selected
 
     @classmethod
-    def score_chunk(
-        cls, query, document, chunk_text, is_image=False, document_query=False
-    ):
+    def score_chunk(cls, query, document, chunk_text, document_query=False):
         query_terms = cls.extract_terms(query)
         content_lower = chunk_text.lower()
         title_lower = (document.title or "").lower()
@@ -331,23 +309,11 @@ class ExternalDocumentRetrievalService:
             if term in title_lower or term in filename_lower:
                 score += 2.0
 
-        if is_image and cls.query_mentions_image(query):
-            score += 8.0
-
         if document_query:
+            # Routing has already established that document evidence is required.
+            # Give available document context a uniform baseline and let lexical
+            # overlap rank within the authorized request scope.
             score += 4.0
-
-        if "ocr-visible text" in content_lower:
-            score += 4.0
-
-        if "primary source of truth" in content_lower:
-            score += 4.0
-
-        if "image/screenshot analysis" in content_lower:
-            score += 3.0
-
-        if "visual summary" in content_lower:
-            score += 1.5
 
         return round(score, 4)
 
@@ -386,28 +352,6 @@ class ExternalDocumentRetrievalService:
             for term in re.findall(r"[a-zA-Z0-9]+", query.lower())
             if term not in stopwords and len(term) > 1
         }
-
-    @classmethod
-    def query_mentions_image(cls, query):
-        normalized = query.lower()
-
-        return any(
-            keyword in normalized
-            for keyword in [
-                "image",
-                "screenshot",
-                "photo",
-                "picture",
-                "screen shot",
-                "screen",
-            ]
-        )
-
-    @classmethod
-    def looks_like_document_query(cls, query):
-        normalized = query.lower()
-
-        return any(keyword in normalized for keyword in cls.DOCUMENT_QUERY_HINTS)
 
     @staticmethod
     def has_sufficient_context(query, chunks, document_query=False):

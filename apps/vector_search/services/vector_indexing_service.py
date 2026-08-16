@@ -7,8 +7,12 @@ from apps.vector_search.services.embedding_provider import EmbeddingProviderFact
 
 class VectorIndexingService:
     @classmethod
-    @transaction.atomic
-    def index_document(cls, document, provider_name="local_hashing"):
+    def index_document(
+        cls,
+        document,
+        provider_name="local_hashing",
+        progress_callback=None,
+    ):
         extraction = getattr(document, "text_extraction", None)
 
         if not extraction or not extraction.extracted_text.strip():
@@ -21,10 +25,28 @@ class VectorIndexingService:
         provider = EmbeddingProviderFactory.get_provider(provider_name)
         chunks = ChunkingService.chunk_text(extraction.extracted_text)
 
-        DocumentChunk.objects.filter(document=document).delete()
+        if progress_callback:
+            progress_callback(
+                "chunking",
+                {
+                    "chunk_count": len(chunks),
+                },
+            )
 
         chunk_objects = []
 
+        if progress_callback:
+            progress_callback(
+                "embedding",
+                {
+                    "chunk_count": len(chunks),
+                    "embedding_provider": provider.provider_name,
+                    "embedding_dimensions": provider.dimensions,
+                },
+            )
+
+        # Embedding work can be CPU/network-heavy. Do it before opening the DB
+        # transaction so document indexing does not hold a long transaction open.
         for index, chunk in enumerate(chunks):
             embedding = provider.embed_text(chunk["content"])
 
@@ -49,10 +71,22 @@ class VectorIndexingService:
                 )
             )
 
-        DocumentChunk.objects.bulk_create(chunk_objects)
+        if progress_callback:
+            progress_callback(
+                "indexing",
+                {
+                    "chunk_count": len(chunk_objects),
+                    "embedding_provider": provider.provider_name,
+                    "embedding_dimensions": provider.dimensions,
+                },
+            )
 
-        document.is_indexed = bool(chunk_objects)
-        document.save(update_fields=["is_indexed", "updated_at"])
+        with transaction.atomic():
+            DocumentChunk.objects.filter(document=document).delete()
+            DocumentChunk.objects.bulk_create(chunk_objects)
+
+            document.is_indexed = bool(chunk_objects)
+            document.save(update_fields=["is_indexed", "updated_at"])
 
         return {
             "indexed": bool(chunk_objects),

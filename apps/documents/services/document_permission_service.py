@@ -185,6 +185,52 @@ class DocumentPermissionService:
         )
 
     @classmethod
+    def can_download_document(cls, user, document, assume_view_access=False):
+        if not document:
+            return False
+
+        if not assume_view_access and not cls.has_document_access(
+            user=user,
+            document=document,
+            required_access=DocumentAccessPolicy.AccessLevel.VIEW,
+        ):
+            return False
+
+        if cls.is_company_admin(user) or document.uploaded_by_id == getattr(
+            user, "id", None
+        ):
+            return True
+
+        prefetched = getattr(document, "_prefetched_objects_cache", {}).get(
+            "access_policies"
+        )
+
+        if prefetched is None:
+            policies = list(
+                DocumentAccessPolicy.objects.filter(
+                    document=document,
+                    is_deleted=False,
+                ).filter(Q(user=user) | Q(role=getattr(user, "role", "")))
+            )
+        else:
+            policies = [
+                policy
+                for policy in prefetched
+                if not policy.is_deleted
+                and (
+                    policy.user_id == getattr(user, "id", None)
+                    or (policy.role and policy.role == getattr(user, "role", ""))
+                )
+            ]
+
+        # Explicit document policy controls download when one applies. Department-
+        # based access falls back to view access when there is no explicit policy.
+        if policies:
+            return any(policy.can_download for policy in policies)
+
+        return True
+
+    @classmethod
     def get_highest_access_level(cls, user, document):
         if cls.is_company_admin(user):
             return DocumentAccessPolicy.AccessLevel.ADMIN
