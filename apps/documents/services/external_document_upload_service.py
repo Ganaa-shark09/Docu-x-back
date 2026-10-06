@@ -1,3 +1,5 @@
+from django.db import transaction
+
 from apps.ai_engine.models import AIConversation, AIConversationDocument
 from apps.documents.models import Document, DocumentVersion
 from apps.documents.services import (
@@ -37,6 +39,7 @@ class ExternalDocumentUploadService:
         )
 
     @classmethod
+    @transaction.atomic
     def upload_external_document(
         cls,
         user,
@@ -48,7 +51,7 @@ class ExternalDocumentUploadService:
         document_type=None,
         sensitivity_label=None,
     ):
-        DocumentFileValidationService.validate_file(uploaded_file)
+        detected_mime_type = DocumentFileValidationService.validate_file(uploaded_file)
 
         conversation = conversation or cls.get_or_create_external_conversation(
             user=user,
@@ -73,7 +76,7 @@ class ExternalDocumentUploadService:
             file=uploaded_file,
             original_filename=uploaded_file.name,
             file_size=uploaded_file.size,
-            mime_type=getattr(uploaded_file, "content_type", ""),
+            mime_type=detected_mime_type,
             checksum=checksum,
         )
 

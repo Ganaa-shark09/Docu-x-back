@@ -1,11 +1,18 @@
 import os
 
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings.local")
+from django.core.exceptions import ImproperlyConfigured
+
+
+if not os.environ.get("DJANGO_SETTINGS_MODULE"):
+    raise ImproperlyConfigured("DJANGO_SETTINGS_MODULE must be explicitly configured.")
+
 
 from django.core.asgi import get_asgi_application  # noqa: E402
 
-# Initialize Django before importing application code that may touch ORM models.
+
+# Initialize Django before importing code that may access ORM models.
 django_asgi_app = get_asgi_application()
+
 
 from channels.routing import ProtocolTypeRouter, URLRouter  # noqa: E402
 from channels.security.websocket import OriginValidator  # noqa: E402

@@ -4,6 +4,12 @@ from apps.ai_engine.models import AIConversation, AIMessage
 from apps.ai_engine.services.internal_document_scope_service import (
     InternalDocumentScopeService,
 )
+from apps.ai_engine.services.internal_document_relevance_service import (
+    InternalDocumentRelevanceService,
+)
+from apps.ai_engine.services.internal_general_answer_service import (
+    InternalGeneralAnswerService,
+)
 from apps.ai_engine.services.llm_gateway_service import LLMGatewayService
 from apps.ai_engine.services.llm_provider_config_service import LLMProviderConfigService
 from apps.ai_engine.services.prompt_builder_service import PromptBuilderService
@@ -70,6 +76,14 @@ class RAGChatService:
             document_uuids=resolved_document_scope.search_document_uuids,
         )
 
+        retrieved_chunks = InternalDocumentRelevanceService.filter_relevant_chunks(
+            question=message,
+            retrieved_chunks=retrieved_chunks,
+            force_document_scope=(
+                resolved_document_scope.mode == InternalDocumentScopeService.SELECTED
+            ),
+        )
+
         requested_provider_config = (
             LLMProviderConfigService.get_default_config_for_company(user.company)
         )
@@ -82,6 +96,14 @@ class RAGChatService:
 
         safe_chunks = enforcement_result["chunks"]
         effective_provider_config = enforcement_result["provider_config"]
+
+        if not safe_chunks and enforcement_result.get("blocked_count", 0) == 0:
+            return cls._answer_without_document_context(
+                conversation=conversation,
+                user_message=user_message,
+                message=message,
+                document_scope_metadata=document_scope_metadata,
+            )
 
         prompt = PromptBuilderService.build_rag_prompt(
             user_question=message,
@@ -180,6 +202,57 @@ class RAGChatService:
                 "blocked_count": enforcement_result.get("blocked_count"),
                 "redacted_count": enforcement_result.get("redacted_count"),
                 "policy_actions": enforcement_result.get("policy_actions"),
+            },
+        }
+
+    @classmethod
+    def _answer_without_document_context(
+        cls,
+        conversation,
+        user_message,
+        message,
+        document_scope_metadata,
+    ):
+        llm_result = InternalGeneralAnswerService.generate(
+            message=message,
+            conversation=conversation,
+            current_user_message_uuid=user_message.uuid,
+        )
+
+        assistant_message = AIMessage.objects.create(
+            conversation=conversation,
+            role=AIMessage.Role.ASSISTANT,
+            content=llm_result["answer"],
+            retrieved_sources=[],
+            model_provider=llm_result["provider"],
+            model_name=llm_result["model"],
+            prompt_tokens=llm_result["prompt_tokens"],
+            completion_tokens=llm_result["completion_tokens"],
+            total_tokens=llm_result["total_tokens"],
+            metadata={
+                "document_scope": document_scope_metadata,
+                "document_context_used": False,
+                "user_message_uuid": str(user_message.uuid),
+                "llm_metadata": llm_result.get("metadata", {}),
+            },
+        )
+
+        conversation.save(update_fields=["updated_at"])
+
+        return {
+            "conversation": conversation,
+            "user_message": user_message,
+            "assistant_message": assistant_message,
+            "sources": [],
+            "document_context": document_scope_metadata,
+            "firewall": {
+                "requested_provider_type": None,
+                "effective_provider_type": llm_result["provider"],
+                "forced_local": llm_result["provider"] == "ollama",
+                "allowed_count": 0,
+                "blocked_count": 0,
+                "redacted_count": 0,
+                "policy_actions": [],
             },
         }
 

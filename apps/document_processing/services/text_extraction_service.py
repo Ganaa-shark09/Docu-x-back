@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 
@@ -57,21 +58,69 @@ class TextExtractionService:
     @classmethod
     def extract_pdf(cls, document, file_path):
         pages_text = []
+        ocr_pages = []
+        ocr_errors = []
+        ocr_attempt_count = 0
+        page_count = 0
+        min_native_chars = int(os.getenv("PDF_OCR_MIN_NATIVE_CHARS_PER_PAGE", "40"))
+        max_ocr_pages = int(os.getenv("PDF_OCR_MAX_PAGES", "40"))
+        ocr_resolution = int(os.getenv("PDF_OCR_RESOLUTION", "160"))
 
         with pdfplumber.open(file_path) as pdf:
+            page_count = len(pdf.pages)
             for page_number, page in enumerate(pdf.pages, start=1):
-                page_text = (page.extract_text() or "").strip()
-                pages_text.append(f"[Page {page_number}]\n{page_text}".strip())
+                native_text = (page.extract_text() or "").strip()
+                page_text = native_text
+                native_signal = len(re.findall(r"[A-Za-z0-9]", native_text))
+                should_ocr = (
+                    native_signal < min_native_chars
+                    and ocr_attempt_count < max_ocr_pages
+                )
+
+                if should_ocr:
+                    ocr_attempt_count += 1
+                    try:
+                        image = page.to_image(resolution=ocr_resolution).original
+                        prepared_image = cls.prepare_image_for_ocr(image)
+                        raw_ocr = pytesseract.image_to_string(
+                            prepared_image,
+                            config="--psm 6",
+                        )
+                        ocr_text = cls.clean_ocr_text(raw_ocr)
+
+                        if ocr_text:
+                            page_text = ocr_text
+                            ocr_pages.append(page_number)
+                    except Exception as exc:
+                        ocr_errors.append(
+                            {"page": page_number, "error": str(exc)[:500]}
+                        )
+
+                if page_text.strip():
+                    pages_text.append(f"[Page {page_number}]\n{page_text}".strip())
 
         text = "\n\n".join(pages_text).strip()
+        extraction_method = (
+            DocumentTextExtraction.ExtractionMethod.OCR
+            if ocr_pages
+            else DocumentTextExtraction.ExtractionMethod.PDF_TEXT
+        )
 
         return cls.save_extraction(
             document=document,
             text=text,
-            extraction_method=DocumentTextExtraction.ExtractionMethod.PDF_TEXT,
-            page_count=len(pages_text),
-            confidence_score=90 if text else 0,
-            metadata={"source": "pdfplumber"},
+            extraction_method=extraction_method,
+            page_count=page_count,
+            confidence_score=(82 if ocr_pages else 90) if text else 0,
+            metadata={
+                "source": "pdfplumber_with_tesseract_fallback",
+                "ocr_pages": ocr_pages,
+                "ocr_page_count": len(ocr_pages),
+                "ocr_attempt_count": ocr_attempt_count,
+                "ocr_errors": ocr_errors,
+                "ocr_page_limit": max_ocr_pages,
+                "ocr_resolution": ocr_resolution,
+            },
         )
 
     @classmethod

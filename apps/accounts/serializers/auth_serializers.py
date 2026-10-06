@@ -6,11 +6,19 @@ from apps.accounts.models import User
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
-    company_name = serializers.CharField(source="company.name", read_only=True)
-    company_slug = serializers.CharField(source="company.slug", read_only=True)
+    company_name = serializers.CharField(
+        source="company.name",
+        read_only=True,
+    )
+
+    company_slug = serializers.CharField(
+        source="company.slug",
+        read_only=True,
+    )
 
     class Meta:
         model = User
+
         fields = [
             "id",
             "username",
@@ -26,6 +34,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "is_email_verified",
             "is_active",
         ]
+
         read_only_fields = [
             "id",
             "username",
@@ -40,10 +49,21 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
 
 class LoginSerializer(serializers.Serializer):
-    username = serializers.CharField(required=False)
-    email = serializers.EmailField(required=False)
-    email_or_username = serializers.CharField(required=False)
-    password = serializers.CharField(write_only=True)
+    username = serializers.CharField(
+        required=False,
+    )
+
+    email = serializers.EmailField(
+        required=False,
+    )
+
+    email_or_username = serializers.CharField(
+        required=False,
+    )
+
+    password = serializers.CharField(
+        write_only=True,
+    )
 
     def validate(self, attrs):
         request = self.context.get("request")
@@ -53,17 +73,21 @@ class LoginSerializer(serializers.Serializer):
             or attrs.get("username")
             or attrs.get("email")
         )
+
         password = attrs.get("password")
 
         if not login_identifier:
             raise serializers.ValidationError(
                 {
-                    "email_or_username": "This field is required. You can also send username or email."
+                    "email_or_username": (
+                        "This field is required. "
+                        "You can also send username or email."
+                    )
                 }
             )
 
         if not password:
-            raise serializers.ValidationError({"password": "This field is required."})
+            raise serializers.ValidationError({"password": ("This field is required.")})
 
         user = (
             User.objects.filter(email__iexact=login_identifier).first()
@@ -88,26 +112,18 @@ class LoginSerializer(serializers.Serializer):
         refresh = RefreshToken.for_user(authenticated_user)
 
         return {
-            "tokens": {
-                "access": str(refresh.access_token),
-                "refresh": str(refresh),
-            },
+            "access": str(refresh.access_token),
+            # Internal value only.
+            # LoginAPIView removes it before sending JSON.
+            "_refresh_cookie": str(refresh),
             "user": UserProfileSerializer(authenticated_user).data,
         }
 
 
 class LogoutSerializer(serializers.Serializer):
-    refresh = serializers.CharField()
+    """
+    Kept for compatibility with imports elsewhere.
 
-    def validate(self, attrs):
-        self.refresh_token = attrs["refresh"]
-        return attrs
-
-    def save(self, **kwargs):
-        try:
-            token = RefreshToken(self.refresh_token)
-            token.blacklist()
-        except Exception as exc:
-            raise serializers.ValidationError(
-                "Invalid or expired refresh token."
-            ) from exc
+    Refresh tokens are now obtained from the HttpOnly cookie,
+    not request JSON.
+    """

@@ -34,7 +34,7 @@ class ExternalChatAPIView(APIView):
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        message = request.data.get("message")
+        message = str(request.data.get("message") or "").strip()
         if not message:
             return Response(
                 {"message": "This field is required."},
@@ -46,6 +46,33 @@ class ExternalChatAPIView(APIView):
             request.data.get("document_uuids")
         )
         document_uuids = document_uuids or None
+
+        requested_scope_mode = (
+            str(request.data.get("document_scope_mode") or "").strip().lower()
+        )
+        if requested_scope_mode not in {"", "selected", "conversation"}:
+            return Response(
+                {
+                    "document_scope_mode": (
+                        "Must be either 'selected' or 'conversation' when supplied."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            top_k = int(request.data.get("top_k", 8))
+        except (TypeError, ValueError):
+            return Response(
+                {"top_k": "Must be an integer between 1 and 20."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if top_k < 1 or top_k > 20:
+            return Response(
+                {"top_k": "Must be an integer between 1 and 20."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         use_web_value = request.data.get("use_web", True)
         use_web = (
             use_web_value
@@ -69,6 +96,7 @@ class ExternalChatAPIView(APIView):
                 user=request.user,
                 document_uuids=document_uuids,
                 conversation_uuid=conversation_uuid,
+                scope_mode_hint=requested_scope_mode or None,
             )
             document_descriptors = readiness["documents"]
             document_scope_mode = readiness.get("document_scope_mode", "selected")
@@ -84,25 +112,52 @@ class ExternalChatAPIView(APIView):
                 )
 
             if readiness["has_processing"] or readiness["has_failed"]:
-                conversation = None
-                if conversation_uuid:
-                    conversation = AIConversation.objects.filter(
-                        uuid=conversation_uuid,
-                        company=request.user.company,
-                        user=request.user,
-                        scope=AIConversation.Scope.EXTERNAL,
-                        is_deleted=False,
-                    ).first()
+                # Selected scope is an explicit instruction to use these files, so
+                # readiness can be decided immediately without spending a model call
+                # asking whether the documents are needed. This also makes the
+                # upload+query path return HTTP 202 quickly while processing runs.
+                if document_scope_mode == "selected":
+                    routing_plan = {
+                        "action": ExternalSemanticOrchestratorService.ACTION_DOCUMENT,
+                        "document_dependency": (
+                            ExternalSemanticOrchestratorService.DOCUMENT_DEPENDENCY_REQUIRED
+                        ),
+                        "document_task": "qa",
+                        "document_query": message,
+                        "web_query": "",
+                        "answer_tier": "quality",
+                        "task_domain": "general",
+                        "answer_profile": "general",
+                        "reasoning_mode": "none",
+                        "quality_focus": [],
+                        "quality_requirements": [],
+                        "provider": "system",
+                        "model": "selected_document_readiness_gate",
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "metadata": {"selected_document_scope_forced": True},
+                    }
+                else:
+                    conversation = None
+                    if conversation_uuid:
+                        conversation = AIConversation.objects.filter(
+                            uuid=conversation_uuid,
+                            company=request.user.company,
+                            user=request.user,
+                            scope=AIConversation.Scope.EXTERNAL,
+                            is_deleted=False,
+                        ).first()
 
-                routing_plan = ExternalSemanticOrchestratorService.plan_resilient(
-                    message=message,
-                    conversation=conversation,
-                    has_attached_documents=bool(document_uuids),
-                    has_explicit_documents=(document_scope_mode == "selected"),
-                    use_web=use_web,
-                    document_descriptors=document_descriptors,
-                    document_scope_mode=document_scope_mode,
-                )
+                    routing_plan = ExternalSemanticOrchestratorService.plan_resilient(
+                        message=message,
+                        conversation=conversation,
+                        has_attached_documents=bool(document_uuids),
+                        has_explicit_documents=False,
+                        use_web=use_web,
+                        document_descriptors=document_descriptors,
+                        document_scope_mode=document_scope_mode,
+                    )
 
                 requires_documents = (
                     routing_plan.get("document_dependency")
@@ -130,14 +185,16 @@ class ExternalChatAPIView(APIView):
                 if requires_documents and (
                     readiness["has_processing"] or not readiness["all_ready"]
                 ):
+                    pending_uuids = [
+                        item["uuid"] for item in readiness["processing_documents"]
+                    ]
                     return Response(
                         {
                             "status": "attachments_processing",
                             "detail": "The documents required for this query are still being processed.",
-                            "wait_for_document_uuids": [
-                                item["uuid"]
-                                for item in readiness["processing_documents"]
-                            ],
+                            "wait_for_document_uuids": pending_uuids,
+                            "pending_document_uuids": pending_uuids,
+                            "retry_after_ms": 2000,
                             **readiness,
                         },
                         status=status.HTTP_202_ACCEPTED,
@@ -147,7 +204,7 @@ class ExternalChatAPIView(APIView):
             user=request.user,
             message=message,
             conversation_uuid=conversation_uuid,
-            top_k=int(request.data.get("top_k", 8)),
+            top_k=top_k,
             use_web=use_web,
             document_uuids=document_uuids,
             routing_plan=routing_plan,

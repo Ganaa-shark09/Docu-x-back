@@ -64,7 +64,13 @@ class ExternalDocumentReadinessService:
         ]
 
     @classmethod
-    def resolve_scope_mode(cls, user, requested_uuids, conversation_uuid=None):
+    def resolve_scope_mode(
+        cls,
+        user,
+        requested_uuids,
+        conversation_uuid=None,
+        scope_mode_hint=None,
+    ):
         requested = cls.normalize_uuids(requested_uuids)
         if not requested:
             return "none", []
@@ -73,13 +79,30 @@ class ExternalDocumentReadinessService:
             user=user,
             conversation_uuid=conversation_uuid,
         )
+
+        hint = str(scope_mode_hint or "").strip().lower()
+
+        if hint == "selected":
+            return "selected", conversation_uuids
+
+        if hint == "conversation":
+            if conversation_uuids and set(requested) == set(conversation_uuids):
+                return "conversation", conversation_uuids
+            return "selected", conversation_uuids
+
         if conversation_uuids and set(requested) == set(conversation_uuids):
             return "conversation", conversation_uuids
 
         return "selected", conversation_uuids
 
     @classmethod
-    def inspect(cls, user, document_uuids, conversation_uuid=None):
+    def inspect(
+        cls,
+        user,
+        document_uuids,
+        conversation_uuid=None,
+        scope_mode_hint=None,
+    ):
         requested = cls.normalize_uuids(document_uuids)
         documents = cls.get_documents(
             user=user,
@@ -94,6 +117,7 @@ class ExternalDocumentReadinessService:
             user=user,
             requested_uuids=requested,
             conversation_uuid=conversation_uuid,
+            scope_mode_hint=scope_mode_hint,
         )
 
         statuses = [cls.serialize_status(document) for document in documents]
@@ -151,12 +175,14 @@ class ExternalDocumentReadinessService:
             "uuid": str(document.uuid),
             "title": document.title,
             "original_filename": document.original_filename,
-            "mime_type": document.mime_type or "",
-            "document_type": document.document_type or "",
+            "mime_type": getattr(document, "mime_type", "") or "",
+            "document_type": getattr(document, "document_type", "") or "",
             "status": document.status,
             "state": state,
-            "processing_stage": document.processing_stage,
-            "processing_progress": int(document.processing_progress or 0),
+            "processing_stage": getattr(document, "processing_stage", "") or "",
+            "processing_progress": int(
+                getattr(document, "processing_progress", 0) or 0
+            ),
             "is_ai_ready": bool(document.is_ai_ready),
             "is_ocr_completed": bool(document.is_ocr_completed),
             "is_indexed": bool(document.is_indexed),

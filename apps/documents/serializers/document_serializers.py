@@ -388,7 +388,9 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
             uploaded_by=request.user,
             original_filename=uploaded_file.name,
             file_size=uploaded_file.size,
-            mime_type=getattr(uploaded_file, "content_type", ""),
+            mime_type=(
+                DocumentFileValidationService.get_detected_mime_type(uploaded_file)
+            ),
             checksum=checksum,
             **validated_data,
         )

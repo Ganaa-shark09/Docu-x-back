@@ -87,3 +87,54 @@ class ExternalSemanticOrchestratorRecoveryTests(SimpleTestCase):
         self.assertIn("Screenshot 2026-08-07.png", prompt)
         self.assertIn("image/png", prompt)
         self.assertIn("conversation: no subset was selected", prompt)
+
+
+class ExternalSemanticSelectedScopeNormalizationTests(SimpleTestCase):
+    def test_selected_scope_cannot_be_downgraded_to_direct(self):
+        result = ExternalSemanticOrchestratorService._normalize(
+            result={
+                "action": "direct",
+                "clarification": "",
+                "fast_answer": "Generic answer",
+                "document_query": "",
+                "web_query": "",
+                "document_task": "none",
+                "document_dependency": "none",
+                "answer_tier": "fast",
+                "task_domain": "general",
+                "reasoning_mode": "none",
+                "quality_focus": [],
+            },
+            has_attached_documents=True,
+            has_explicit_documents=True,
+            use_web=True,
+        )
+
+        self.assertEqual(result["action"], "document")
+        self.assertEqual(result["document_dependency"], "required")
+        self.assertEqual(result["document_task"], "qa")
+        self.assertEqual(result["fast_answer"], "")
+
+    def test_selected_scope_preserves_model_document_task(self):
+        result = ExternalSemanticOrchestratorService._normalize(
+            result={
+                "action": "direct",
+                "clarification": "",
+                "fast_answer": "",
+                "document_query": "summarize selected file",
+                "web_query": "",
+                "document_task": "summarize",
+                "document_dependency": "none",
+                "answer_tier": "quality",
+                "task_domain": "general",
+                "reasoning_mode": "standard",
+                "quality_focus": [],
+            },
+            has_attached_documents=True,
+            has_explicit_documents=True,
+            use_web=True,
+        )
+
+        self.assertEqual(result["action"], "document")
+        self.assertEqual(result["document_dependency"], "required")
+        self.assertEqual(result["document_task"], "summarize")

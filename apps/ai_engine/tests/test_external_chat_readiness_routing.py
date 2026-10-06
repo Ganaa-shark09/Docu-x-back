@@ -44,7 +44,10 @@ class ExternalChatReadinessRoutingTests(SimpleTestCase):
         plan,
         chat,
     ):
-        inspect.return_value = self._processing_readiness()
+        inspect.return_value = {
+            **self._processing_readiness(),
+            "document_scope_mode": "conversation",
+        }
         plan.return_value = {
             "action": "direct",
             "document_dependency": "none",
@@ -85,6 +88,7 @@ class ExternalChatReadinessRoutingTests(SimpleTestCase):
             {
                 "message": "How are you?",
                 "document_uuids": ["doc-1"],
+                "document_scope_mode": "conversation",
             },
             format="json",
         )
@@ -201,6 +205,7 @@ class ExternalChatReadinessRoutingTests(SimpleTestCase):
             {
                 "message": "Explain this screenshot",
                 "document_uuids": ["doc-1"],
+                "document_scope_mode": "selected",
             },
             format="json",
         )
@@ -249,6 +254,7 @@ class ExternalChatReadinessRoutingTests(SimpleTestCase):
             {
                 "message": "Explain the selected file",
                 "document_uuids": ["doc-1"],
+                "document_scope_mode": "selected",
             },
             format="json",
         )

@@ -35,6 +35,22 @@ class ExternalSemanticOrchestratorService:
         ACTION_CLARIFY,
     }
 
+    VALID_WEB_FRESHNESS = {
+        "none",
+        "current",
+        "recent",
+        "historical",
+    }
+
+    VALID_WEB_QUERY_TYPES = {
+        "stable_knowledge",
+        "current_fact",
+        "news",
+        "article_lookup",
+        "source_lookup",
+        "web_research",
+    }
+
     QUALITY_FOCUS_API = "api_correctness"
     QUALITY_FOCUS_CONCURRENCY = "concurrency"
     QUALITY_FOCUS_FAILURES = "failure_modes"
@@ -72,6 +88,36 @@ class ExternalSemanticOrchestratorService:
             "fast_answer": {"type": "string"},
             "document_query": {"type": "string"},
             "web_query": {"type": "string"},
+            "web_required": {
+                "type": "boolean",
+            },
+            "web_freshness": {
+                "type": "string",
+                "enum": sorted(VALID_WEB_FRESHNESS),
+            },
+            "web_query_type": {
+                "type": "string",
+                "enum": sorted(VALID_WEB_QUERY_TYPES),
+            },
+            "web_resolved_question": {
+                "type": "string",
+            },
+            "web_requested_source": {
+                "type": "string",
+            },
+            "web_exact_title": {
+                "type": "string",
+            },
+            "web_claim_to_verify": {
+                "type": "string",
+            },
+            "web_search_queries": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                },
+                "maxItems": 4,
+            },
             "document_task": {
                 "type": "string",
                 "enum": ["none", "qa", "extract", "summarize", "analyze"],
@@ -114,6 +160,7 @@ class ExternalSemanticOrchestratorService:
             "fast_answer",
             "document_query",
             "web_query",
+            "web_required",
             "document_task",
             "document_dependency",
             "answer_tier",
@@ -188,7 +235,7 @@ class ExternalSemanticOrchestratorService:
                             )
                         ),
                         "num_predict": int(
-                            os.getenv("OLLAMA_ORCHESTRATOR_MAX_TOKENS", "220")
+                            os.getenv("OLLAMA_ORCHESTRATOR_MAX_TOKENS", "360")
                         ),
                     },
                 },
@@ -366,12 +413,20 @@ class ExternalSemanticOrchestratorService:
         documents_available = bool(
             has_attached_documents or has_explicit_documents or document_descriptors
         )
-        needs_recovery = (
+
+        clarify_recovery = (
             documents_available
             and first.get("action") == cls.ACTION_CLARIFY
             and first.get("document_dependency") != cls.DOCUMENT_DEPENDENCY_REQUIRED
         )
-        if not needs_recovery:
+
+        explicit_document_verification = (
+            bool(has_explicit_documents)
+            and first.get("action") in {cls.ACTION_DIRECT, cls.ACTION_CLARIFY}
+            and first.get("document_dependency") != cls.DOCUMENT_DEPENDENCY_REQUIRED
+        )
+
+        if not (clarify_recovery or explicit_document_verification):
             return first
 
         recovered = cls.plan(
@@ -388,10 +443,25 @@ class ExternalSemanticOrchestratorService:
             ignore_history=True,
         )
 
+        recovered_requires_documents = recovered.get(
+            "document_dependency"
+        ) == cls.DOCUMENT_DEPENDENCY_REQUIRED or recovered.get("action") in {
+            cls.ACTION_DOCUMENT,
+            cls.ACTION_DOCUMENT_WEB,
+        }
+
+        if explicit_document_verification and not clarify_recovery:
+            if not recovered_requires_documents:
+                return first
+
         metadata = dict(recovered.get("metadata") or {})
         metadata["routing_recovery"] = {
             "performed": True,
-            "reason": "clarify_with_available_documents",
+            "reason": (
+                "clarify_with_available_documents"
+                if clarify_recovery
+                else "verify_explicit_document_dependency"
+            ),
             "initial_action": first.get("action"),
             "initial_document_dependency": first.get("document_dependency"),
         }
@@ -419,6 +489,53 @@ class ExternalSemanticOrchestratorService:
         fast_answer = (result.get("fast_answer") or "").strip()
         document_query = (result.get("document_query") or "").strip()
         web_query = (result.get("web_query") or "").strip()
+        web_required = bool(result.get("web_required"))
+        web_freshness = str(result.get("web_freshness") or "none").strip().lower()
+        web_query_type = (
+            str(result.get("web_query_type") or "stable_knowledge").strip().lower()
+        )
+        web_resolved_question = str(result.get("web_resolved_question") or "").strip()[
+            :900
+        ]
+        web_requested_source = str(result.get("web_requested_source") or "").strip()[
+            :180
+        ]
+        web_exact_title = str(result.get("web_exact_title") or "").strip()[:500]
+        web_claim_to_verify = str(result.get("web_claim_to_verify") or "").strip()[:900]
+
+        raw_web_queries = result.get("web_search_queries") or []
+
+        if isinstance(
+            raw_web_queries,
+            str,
+        ):
+            raw_web_queries = [raw_web_queries]
+
+        web_search_queries = []
+        seen_web_queries = set()
+
+        if isinstance(
+            raw_web_queries,
+            (
+                list,
+                tuple,
+            ),
+        ):
+            for item in raw_web_queries:
+                value = " ".join(str(item or "").split())[:700]
+
+                key = value.casefold()
+
+                if not value or key in seen_web_queries:
+                    continue
+
+                seen_web_queries.add(key)
+
+                web_search_queries.append(value)
+
+                if len(web_search_queries) >= 4:
+                    break
+
         document_task = (result.get("document_task") or "none").strip().lower()
         document_dependency = (
             (result.get("document_dependency") or cls.DOCUMENT_DEPENDENCY_NONE)
@@ -471,7 +588,65 @@ class ExternalSemanticOrchestratorService:
         if reasoning_mode not in {"none", "standard", "deep"}:
             reasoning_mode = "standard"
 
+        if web_freshness not in cls.VALID_WEB_FRESHNESS:
+            web_freshness = "none"
+
+        if web_query_type not in cls.VALID_WEB_QUERY_TYPES:
+            web_query_type = "web_research" if web_required else "stable_knowledge"
+
+        #
+        # web_required is an independent semantic
+        # safety decision. A routing-model mismatch
+        # such as direct + web_required=True must
+        # never become a memory-only answer.
+        #
+        if web_required:
+            if action == cls.ACTION_DIRECT:
+                action = cls.ACTION_WEB
+
+            elif action == cls.ACTION_DOCUMENT:
+                action = cls.ACTION_DOCUMENT_WEB
+
+        if action in {
+            cls.ACTION_WEB,
+            cls.ACTION_DOCUMENT_WEB,
+        }:
+            web_required = True
+
+            if web_freshness == "none":
+                web_freshness = "current"
+
+            if not web_query:
+                web_query = (
+                    web_search_queries[0] if web_search_queries else ""
+                ) or web_resolved_question
+
+        elif action != cls.ACTION_CLARIFY:
+            web_required = False
+            web_freshness = "none"
+            web_query_type = "stable_knowledge"
+            web_resolved_question = ""
+            web_requested_source = ""
+            web_exact_title = ""
+            web_claim_to_verify = ""
+            web_search_queries = []
+
         documents_available = bool(has_attached_documents or has_explicit_documents)
+
+        # A selected scope is an explicit user instruction for this turn. Do not
+        # allow the semantic router to silently discard that scope and answer as
+        # a general chat request. The model still classifies the document task,
+        # but selected documents must participate in the answer.
+        if has_explicit_documents and documents_available:
+            document_dependency = cls.DOCUMENT_DEPENDENCY_REQUIRED
+
+            if action == cls.ACTION_WEB:
+                action = cls.ACTION_DOCUMENT_WEB if use_web else cls.ACTION_DOCUMENT
+            elif action not in {cls.ACTION_DOCUMENT, cls.ACTION_DOCUMENT_WEB}:
+                action = cls.ACTION_DOCUMENT
+
+            if document_task == "none":
+                document_task = "qa"
 
         # Document dependency is independent from action. The routing model does
         # not need file contents itself; it only decides whether the downstream
@@ -533,6 +708,14 @@ class ExternalSemanticOrchestratorService:
             )
             plan["document_query"] = document_query
             plan["web_query"] = web_query
+            plan["web_required"] = web_required
+            plan["web_freshness"] = web_freshness
+            plan["web_query_type"] = web_query_type
+            plan["web_resolved_question"] = web_resolved_question
+            plan["web_requested_source"] = web_requested_source
+            plan["web_exact_title"] = web_exact_title
+            plan["web_claim_to_verify"] = web_claim_to_verify
+            plan["web_search_queries"] = web_search_queries
             plan["document_task"] = document_task
             return plan
 
@@ -569,6 +752,14 @@ class ExternalSemanticOrchestratorService:
             "fast_answer": fast_answer,
             "document_query": document_query,
             "web_query": web_query,
+            "web_required": web_required,
+            "web_freshness": web_freshness,
+            "web_query_type": web_query_type,
+            "web_resolved_question": web_resolved_question,
+            "web_requested_source": web_requested_source,
+            "web_exact_title": web_exact_title,
+            "web_claim_to_verify": web_claim_to_verify,
+            "web_search_queries": web_search_queries,
             "document_task": document_task,
             "document_dependency": document_dependency,
             "answer_tier": answer_tier,
@@ -694,8 +885,11 @@ Never use clarify only because the routing model cannot see or access the attach
 Use the document descriptors (filename, MIME type, state) to resolve semantic references
 to an available artifact. The user does not need to repeat the exact filename.
 Document scope semantics:
-- selected: the frontend supplied a user-selected subset; treat those files as the only
-  eligible document scope if document content is required.
+- selected: the frontend supplied files explicitly for THIS turn (selected in the
+  attachment panel or uploaded with the current prompt). This is an explicit instruction
+  to use those files. Set document_dependency=required and route to document/document_web.
+  Do not downgrade a selected-scope request to direct merely because the wording is vague,
+  deictic, or short. The downstream document tool can read the selected files.
 - conversation: no subset was selected, so the frontend supplied all documents attached
   to the conversation as candidates. Their presence alone does not make them relevant.
 - none: no document UUID scope was supplied.
@@ -741,6 +935,19 @@ Rules:
 - Never invent document or web content.
 - document_task: qa, extract, summarize, analyze; otherwise none.
 - Keep document_query and web_query concise.
+- web_required is independent from action. Set it true whenever an accurate answer requires current, changing, externally verified public information, factual claim verification against public evidence, or an explicitly requested public web/site/page/article lookup.
+- For stable knowledge, writing, coding, explanation, or reasoning that does not depend on current public facts, set web_required=false.
+- When web_required=true, action must be web or document_web.
+- Use conversation history to resolve follow-ups, pronouns, topic refinements, and previously requested public sources. Previous assistant answers are never factual evidence.
+- Preserve user-supplied entities, organizations, jurisdictions, locations, dates, quoted text, titles, and relationships. Do not invent a missing jurisdiction, country, office, organization, date, or identity.
+- web_requested_source contains only a source/publisher/organization/site explicitly requested or clearly inherited from conversation. Do not invent a domain.
+- web_exact_title contains a specific page/article/report/post/paper title when supplied or clearly referenced.
+- web_claim_to_verify contains the factual claim to check when applicable.
+- web_resolved_question is a standalone version of the current question after resolving conversation references.
+- web_search_queries contains up to 4 concise standalone discovery queries, ordered most precise to broadest. Preserve important literal wording from the user's request.
+- web_freshness is none/current/recent/historical.
+- web_query_type is stable_knowledge/current_fact/news/article_lookup/source_lookup/web_research.
+- For non-web requests use web_required=false, web_freshness=none, web_query_type=stable_knowledge, and empty web-specific strings/arrays.
 - In fast_answer speak as DocuX External AI and do not expose the underlying model/vendor.
 
 documents={has_attached_documents or has_explicit_documents}

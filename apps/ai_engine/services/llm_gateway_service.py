@@ -6,6 +6,9 @@ import time
 import requests
 
 from apps.ai_engine.models import LLMProviderConfig
+from apps.ai_engine.services.llm_provider_security_service import (
+    LLMProviderSecurityService,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +102,14 @@ class LocalFallbackLLMProvider:
         best_sentences = cls._find_relevant_sentences(question, retrieved_chunks)
 
         if not best_sentences:
-            top_chunk = retrieved_chunks[0]
+            # Never dump the top retrieved chunk just because an upstream model
+            # call failed. Retrieval can be weak for very short or unrelated
+            # queries, and exposing arbitrary source text creates both a poor
+            # answer and an unnecessary data-disclosure risk.
             answer = (
-                "The uploaded documents contain related information, but I could not "
-                "extract a precise answer. The most relevant source says:\n\n"
-                f"{top_chunk.get('content', '')[:700]}"
+                "I found document context, but I couldn't identify a sufficiently "
+                "relevant passage to answer that question reliably. Please rephrase "
+                "the question or select the document you want me to use."
             )
         else:
             answer = "\n".join(best_sentences[:4])
@@ -451,6 +457,41 @@ class AzureOpenAILLMProvider:
                 config,
             )
             result["metadata"]["fallback_reason"] = "missing_azure_openai_config"
+            return result
+
+        try:
+            endpoint = LLMProviderSecurityService.validate_endpoint(
+                LLMProviderConfig.ProviderType.AZURE_OPENAI,
+                endpoint,
+            )
+
+            deployment_name = LLMProviderSecurityService.validate_azure_deployment_name(
+                deployment_name
+            )
+
+            api_version = LLMProviderSecurityService.validate_azure_api_version(
+                api_version
+            )
+
+        except ValueError as exc:
+            logger.warning(
+                "azure_openai_endpoint_blocked endpoint=%s error=%s",
+                endpoint,
+                exc,
+            )
+
+            result = LocalFallbackLLMProvider.generate_answer(
+                question,
+                retrieved_chunks,
+                prompt,
+                config,
+            )
+
+            result["metadata"]["fallback_reason"] = (
+                "unsafe_azure_openai_endpoint_blocked"
+            )
+            result["metadata"]["fallback_error"] = str(exc)
+
             return result
 
         url = (

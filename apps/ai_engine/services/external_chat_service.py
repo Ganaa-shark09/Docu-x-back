@@ -23,9 +23,15 @@ from apps.ai_engine.services.external_general_answer_service import (
 from apps.ai_engine.services.external_semantic_orchestrator_service import (
     ExternalSemanticOrchestratorService,
 )
+from apps.ai_engine.services.external_web_plan_service import (
+    ExternalWebPlanService,
+)
 from apps.ai_engine.services.llm_gateway_service import LLMGatewayService
 from apps.ai_engine.services.llm_provider_config_service import LLMProviderConfigService
-from apps.ai_engine.services.web_search_provider_service import WebSearchProviderService
+from apps.data_firewall.services import AIContextPolicyEnforcementService
+from apps.ai_engine.services.external_web_search_service import (
+    ExternalWebSearchService,
+)
 from apps.documents.models import Document
 
 
@@ -160,8 +166,9 @@ class ExternalChatService:
         attached_document_uuids,
     ):
         answer = (
-            "I couldn't retrieve reliable web results for this request. "
-            "Please try again."
+            "I couldn't verify this request with reliable current web evidence. "
+            "I won't guess. Please try again, or ask me to check a specific "
+            "publisher or article."
         )
 
         sources = cls._build_sources(
@@ -271,6 +278,16 @@ class ExternalChatService:
             document_descriptors=document_descriptors,
             document_scope_mode=document_scope_mode,
         )
+
+        web_search_plan = ExternalWebPlanService.from_routing_plan(
+            message=message,
+            routing_plan=plan,
+            use_web=use_web,
+        )
+
+        plan = dict(plan)
+
+        plan["web_search_plan"] = web_search_plan
 
         action = plan["action"]
         document_task = plan.get("document_task", "none")
@@ -438,8 +455,9 @@ class ExternalChatService:
         }:
             web_query = plan.get("web_query") or message
 
-            web_response = WebSearchProviderService.search_with_metadata(
-                query=web_query,
+            web_response = ExternalWebSearchService.search(
+                fallback_query=web_query,
+                search_plan=plan.get("web_search_plan") or {},
                 max_results=5,
             )
 
@@ -456,7 +474,29 @@ class ExternalChatService:
         # ---------------------------------------------------------
         # Tool failure gate
         # ---------------------------------------------------------
-        if action == "web" and not web_results:
+        active_web_plan = plan.get("web_search_plan") or {}
+
+        verified_web_results = [
+            item for item in web_results if str(item.get("content") or "").strip()
+        ]
+
+        needs_verified_web = bool(active_web_plan.get("needs_web")) and action in {
+            "web",
+            "document_web",
+        }
+
+        if (action == "web" and not web_results) or (
+            needs_verified_web and not verified_web_results
+        ):
+            if web_results and not verified_web_results:
+                web_warnings = [
+                    *web_warnings,
+                    (
+                        "Search results were found, but publisher "
+                        "pages could not be verified."
+                    ),
+                ]
+
             return cls._answer_web_context_unavailable(
                 conversation=conversation,
                 user_message=user_message,
@@ -916,17 +956,49 @@ class ExternalChatService:
         failed_documents,
         attached_document_uuids,
     ):
+        requested_provider_config = (
+            LLMProviderConfigService.get_default_config_for_company(user.company)
+        )
+
+        if document_chunks:
+            enforcement_result = AIContextPolicyEnforcementService.enforce(
+                user=user,
+                provider_config=requested_provider_config,
+                retrieved_chunks=document_chunks,
+            )
+
+            safe_document_chunks = enforcement_result["chunks"]
+            effective_provider_config = enforcement_result["provider_config"]
+
+        else:
+            safe_document_chunks = []
+            effective_provider_config = requested_provider_config
+
+            enforcement_result = {
+                "requested_provider_type": (
+                    requested_provider_config.provider_type
+                    if requested_provider_config
+                    else "local"
+                ),
+                "effective_provider_type": (
+                    requested_provider_config.provider_type
+                    if requested_provider_config
+                    else "local"
+                ),
+                "forced_local": False,
+                "allowed_count": 0,
+                "blocked_count": 0,
+                "redacted_count": 0,
+                "policy_actions": [],
+            }
+
         prompt = cls._build_prompt(
             question=message,
             intent=intent,
             document_task=document_task,
-            document_chunks=document_chunks,
+            document_chunks=safe_document_chunks,
             web_results=web_results,
             web_warnings=web_warnings,
-        )
-
-        provider_config = LLMProviderConfigService.get_default_config_for_company(
-            user.company
         )
 
         generation_options = {}
@@ -976,18 +1048,40 @@ class ExternalChatService:
                 }
             )
 
-        llm_result = LLMGatewayService.generate_answer(
-            question=message,
-            retrieved_chunks=document_chunks,
-            prompt=prompt,
-            provider_config=provider_config,
-            allow_general_answer=True,
-            generation_options=generation_options,
-            allow_extractive_fallback=allow_extractive_fallback,
-        )
+        if (
+            document_chunks
+            and not safe_document_chunks
+            and enforcement_result.get("blocked_count", 0) > 0
+        ):
+            llm_result = {
+                "answer": (
+                    "DocuX AI Data Firewall blocked the selected "
+                    "document context because it is restricted or "
+                    "requires approval before AI usage."
+                ),
+                "provider": "data_firewall",
+                "model": "policy_enforcement",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "metadata": {
+                    "reason": ("all_external_document_context_blocked"),
+                },
+            }
+
+        else:
+            llm_result = LLMGatewayService.generate_answer(
+                question=message,
+                retrieved_chunks=safe_document_chunks,
+                prompt=prompt,
+                provider_config=effective_provider_config,
+                allow_general_answer=True,
+                generation_options=generation_options,
+                allow_extractive_fallback=allow_extractive_fallback,
+            )
 
         sources = cls._build_sources(
-            document_chunks=document_chunks,
+            document_chunks=safe_document_chunks,
             web_results=web_results,
             processing_documents=processing_documents,
             failed_documents=failed_documents,
@@ -1011,8 +1105,36 @@ class ExternalChatService:
                     str(item) for item in attached_document_uuids
                 ],
                 "web_result_count": len(web_results),
-                "external_chunk_count": len(document_chunks),
+                "external_chunk_count": len(safe_document_chunks),
                 "document_task": document_task,
+                "firewall_enforcement": {
+                    "requested_provider_type": (
+                        enforcement_result.get("requested_provider_type")
+                    ),
+                    "effective_provider_type": (
+                        enforcement_result.get("effective_provider_type")
+                    ),
+                    "forced_local": enforcement_result.get(
+                        "forced_local",
+                        False,
+                    ),
+                    "allowed_count": enforcement_result.get(
+                        "allowed_count",
+                        0,
+                    ),
+                    "blocked_count": enforcement_result.get(
+                        "blocked_count",
+                        0,
+                    ),
+                    "redacted_count": enforcement_result.get(
+                        "redacted_count",
+                        0,
+                    ),
+                    "policy_actions": enforcement_result.get(
+                        "policy_actions",
+                        [],
+                    ),
+                },
                 "search_warnings": web_warnings,
                 "user_message_uuid": str(user_message.uuid),
                 "llm_metadata": llm_result.get("metadata", {}),
@@ -1027,7 +1149,7 @@ class ExternalChatService:
             assistant_message=assistant_message,
             sources=sources,
             web_results=web_results,
-            external_chunks=document_chunks,
+            external_chunks=safe_document_chunks,
             processing_documents=processing_documents,
             failed_documents=failed_documents,
             search_warnings=web_warnings,
@@ -1059,11 +1181,16 @@ class ExternalChatService:
             context_parts.append("WEB CONTEXT:")
 
             for index, result in enumerate(web_results, start=1):
+                content = result.get("content") or result.get("snippet") or ""
+
+                published_at = result.get("published_at") or "unknown"
+
                 context_parts.append(
                     f"[Web Source {index}]\n"
                     f"Title: {result.get('title')}\n"
-                    f"Snippet: {result.get('snippet')}\n"
-                    f"URL: {result.get('url')}"
+                    f"Published: {published_at}\n"
+                    f"URL: {result.get('url')}\n"
+                    f"Evidence:\n{content}"
                 )
 
         context = "\n\n---\n\n".join(context_parts)
@@ -1088,7 +1215,10 @@ class ExternalChatService:
                 "14. For document summaries, synthesize the whole supplied document context into an overview and meaningful key points; explain the points briefly instead of returning one matching sentence or raw source line.\n"
                 "15. For document analysis, reason across all supplied document context and clearly separate source facts from your interpretation.\n"
                 "16. Match answer depth to the task. For detailed, explanatory, analytical, comparison, code, or multi-step requests, provide the complete answer and do not omit material points merely to be brief.\n"
-                "17. For exact factual document questions, preserve names, dates, numbers, statuses, identifiers, and ordering exactly as supported by the source.\n\n"
+                "17. For exact factual document questions, preserve names, dates, numbers, statuses, identifiers, and ordering exactly as supported by the source.\n"
+                "18. For current/live public facts, make factual claims only when supported by WEB CONTEXT from fetched publisher pages. Search snippets are weaker evidence than fetched publisher text.\n"
+                "19. If web sources disagree, state the disagreement instead of guessing.\n"
+                "20. Never use prior assistant claims as evidence for a current fact.\n\n"
                 f"Intent: {intent}\n"
                 f"Document operation: {document_task}\n\n"
                 f"Context:\n{context}\n\n"
@@ -1112,6 +1242,24 @@ class ExternalChatService:
             "If the question needs current information and no web context is available, say you cannot verify it.\n\n"
             f"Question:\n{question}\n\n"
             "Answer:"
+        )
+
+    @staticmethod
+    def _recent_user_messages(
+        conversation,
+        current_user_message_uuid=None,
+        limit=3,
+    ):
+        queryset = conversation.messages.filter(
+            is_deleted=False,
+            role=AIMessage.Role.USER,
+        )
+
+        if current_user_message_uuid:
+            queryset = queryset.exclude(uuid=current_user_message_uuid)
+
+        return list(
+            queryset.order_by("-created_at").values_list("content", flat=True)[:limit]
         )
 
     @classmethod
@@ -1175,6 +1323,10 @@ class ExternalChatService:
                     "source_type": "web",
                     "title": result.get("title"),
                     "snippet": result.get("snippet"),
+                    "content_preview": (
+                        result.get("content") or result.get("snippet") or ""
+                    )[:900],
+                    "published_at": result.get("published_at"),
                     "url": result.get("url"),
                     "source": result.get("source"),
                 }
@@ -1214,6 +1366,7 @@ class ExternalChatService:
             "answer_tier": plan.get("answer_tier"),
             "model": plan.get("model"),
             "recovery": (plan.get("metadata") or {}).get("routing_recovery"),
+            "web_search_plan": plan.get("web_search_plan") or {},
         }
         user_message.metadata = metadata
         user_message.save(update_fields=["metadata", "updated_at"])

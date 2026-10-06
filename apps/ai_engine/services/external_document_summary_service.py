@@ -10,6 +10,7 @@ from apps.ai_engine.services.external_document_retrieval_service import (
 )
 from apps.ai_engine.services.llm_gateway_service import LLMGatewayService
 from apps.ai_engine.services.llm_provider_config_service import LLMProviderConfigService
+from apps.data_firewall.services import AIContextPolicyEnforcementService
 from apps.documents.models import Document
 
 logger = logging.getLogger(__name__)
@@ -53,9 +54,61 @@ class ExternalDocumentSummaryService:
         if not ready_documents:
             return None
 
-        provider_config = LLMProviderConfigService.get_default_config_for_company(
-            user.company
+        requested_provider_config = (
+            LLMProviderConfigService.get_default_config_for_company(user.company)
         )
+
+        policy_chunks = []
+
+        for document in ready_documents:
+            full_text = cls.get_extracted_text(document)
+
+            if not full_text:
+                continue
+
+            policy_chunks.append(
+                {
+                    "document_uuid": str(document.uuid),
+                    "document_title": document.title,
+                    "content": full_text,
+                    "chunk_index": 0,
+                    "sensitivity_label": (document.sensitivity_label),
+                }
+            )
+
+        if not policy_chunks:
+            return None
+
+        enforcement_result = AIContextPolicyEnforcementService.enforce(
+            user=user,
+            provider_config=requested_provider_config,
+            retrieved_chunks=policy_chunks,
+        )
+
+        # Whole-document summaries must never silently omit a
+        # document blocked by the Data Firewall.
+        if enforcement_result.get("blocked_count", 0) > 0:
+            return cls.firewall_blocked_result(enforcement_result)
+
+        safe_text_by_document_uuid = {
+            str(chunk.get("document_uuid")): (chunk.get("content", ""))
+            for chunk in enforcement_result.get(
+                "chunks",
+                [],
+            )
+            if chunk.get("document_uuid")
+        }
+
+        ready_documents = [
+            document
+            for document in ready_documents
+            if str(document.uuid) in safe_text_by_document_uuid
+        ]
+
+        if not ready_documents:
+            return cls.firewall_blocked_result(enforcement_result)
+
+        provider_config = enforcement_result.get("provider_config")
 
         # Single-pass is reserved for genuinely small sources. Context-window
         # capacity alone is not a performance budget on CPU: a 6k-token prompt
@@ -63,9 +116,16 @@ class ExternalDocumentSummaryService:
         # therefore go directly to fast-model coverage + quality-model synthesis.
         if len(ready_documents) == 1:
             document = ready_documents[0]
-            full_text = cls.get_extracted_text(document)
 
-            if full_text and cls.should_use_single_pass(full_text, question):
+            full_text = safe_text_by_document_uuid.get(
+                str(document.uuid),
+                "",
+            )
+
+            if full_text and cls.should_use_single_pass(
+                full_text,
+                question,
+            ):
                 result = cls.summarize_single_pass(
                     document=document,
                     full_text=full_text,
@@ -74,7 +134,10 @@ class ExternalDocumentSummaryService:
                 )
 
                 if result.get("provider") != "system":
-                    return result
+                    return cls.attach_firewall_metadata(
+                        result,
+                        enforcement_result,
+                    )
 
                 # If the complete pass times out or otherwise fails, degrade to
                 # coverage-preserving hierarchical summarization rather than
@@ -88,14 +151,26 @@ class ExternalDocumentSummaryService:
                     result.get("metadata", {}),
                 )
 
-        return cls.summarize_hierarchical(
+        result = cls.summarize_hierarchical(
             ready_documents=ready_documents,
             question=question,
             provider_config=provider_config,
+            safe_text_by_document_uuid=(safe_text_by_document_uuid),
+        )
+
+        return cls.attach_firewall_metadata(
+            result,
+            enforcement_result,
         )
 
     @classmethod
-    def summarize_hierarchical(cls, ready_documents, question, provider_config):
+    def summarize_hierarchical(
+        cls,
+        ready_documents,
+        question,
+        provider_config,
+        safe_text_by_document_uuid=None,
+    ):
         document_notes = []
         sources = []
         total_prompt_tokens = 0
@@ -104,8 +179,14 @@ class ExternalDocumentSummaryService:
         provider = ""
         model = ""
 
+        safe_text_by_document_uuid = safe_text_by_document_uuid or {}
+
         for document in ready_documents:
-            full_text = cls.get_extracted_text(document)
+            full_text = safe_text_by_document_uuid.get(
+                str(document.uuid),
+                cls.get_extracted_text(document),
+            )
+
             if not full_text:
                 continue
 
@@ -276,6 +357,81 @@ class ExternalDocumentSummaryService:
                 "documents_processed": len(coverage),
                 "coverage": coverage,
                 "final_generation_metadata": final_result.get("metadata", {}),
+            },
+        }
+
+    @classmethod
+    def firewall_metadata(cls, enforcement_result):
+        return {
+            "requested_provider_type": (
+                enforcement_result.get("requested_provider_type")
+            ),
+            "effective_provider_type": (
+                enforcement_result.get("effective_provider_type")
+            ),
+            "forced_local": enforcement_result.get(
+                "forced_local",
+                False,
+            ),
+            "allowed_count": enforcement_result.get(
+                "allowed_count",
+                0,
+            ),
+            "blocked_count": enforcement_result.get(
+                "blocked_count",
+                0,
+            ),
+            "redacted_count": enforcement_result.get(
+                "redacted_count",
+                0,
+            ),
+            "policy_actions": enforcement_result.get(
+                "policy_actions",
+                [],
+            ),
+        }
+
+    @classmethod
+    def attach_firewall_metadata(
+        cls,
+        result,
+        enforcement_result,
+    ):
+        if not result:
+            return result
+
+        metadata = dict(result.get("metadata") or {})
+
+        metadata["firewall_enforcement"] = cls.firewall_metadata(enforcement_result)
+
+        result["metadata"] = metadata
+
+        return result
+
+    @classmethod
+    def firewall_blocked_result(
+        cls,
+        enforcement_result,
+    ):
+        return {
+            "answer": (
+                "DocuX AI Data Firewall blocked one or "
+                "more selected documents because the "
+                "content is restricted or requires "
+                "approval before AI usage. No partial "
+                "summary was generated."
+            ),
+            "sources": [],
+            "provider": "data_firewall",
+            "model": "policy_enforcement",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "metadata": {
+                "whole_document_summary": True,
+                "complete": False,
+                "reason": ("external_summary_context_blocked"),
+                "firewall_enforcement": (cls.firewall_metadata(enforcement_result)),
             },
         }
 

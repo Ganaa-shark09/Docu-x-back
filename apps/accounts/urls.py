@@ -1,11 +1,44 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView
 
-from apps.accounts.views import LoginAPIView, LogoutAPIView, ProfileAPIView
+from apps.accounts.views import (
+    CSRFTokenAPIView,
+    LoginAPIView,
+    LogoutAPIView,
+    ProfileAPIView,
+    RefreshCookieAPIView,
+)
+
 
 urlpatterns = [
-    path("login/", LoginAPIView.as_view(), name="auth-login"),
-    path("refresh/", TokenRefreshView.as_view(), name="auth-refresh"),
-    path("logout/", LogoutAPIView.as_view(), name="auth-logout"),
-    path("profile/", ProfileAPIView.as_view(), name="auth-profile"),
+    path(
+        "csrf/",
+        CSRFTokenAPIView.as_view(),
+        name="auth-csrf",
+    ),
+    path(
+        "login/",
+        LoginAPIView.as_view(),
+        name="auth-login",
+    ),
+    path(
+        "refresh/",
+        RefreshCookieAPIView.as_view(),
+        name="auth-refresh",
+    ),
+    # Temporary backward-compatible alias.
+    path(
+        "token/refresh/",
+        RefreshCookieAPIView.as_view(),
+        name="auth-token-refresh-legacy",
+    ),
+    path(
+        "logout/",
+        LogoutAPIView.as_view(),
+        name="auth-logout",
+    ),
+    path(
+        "profile/",
+        ProfileAPIView.as_view(),
+        name="auth-profile",
+    ),
 ]

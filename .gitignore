@@ -38,3 +38,6 @@ logs/
 postgres_data/
 redis_data/
 minio_data/
+.docux-backups/
+*.before-security
+docux_backend_phase*_fix.sh
