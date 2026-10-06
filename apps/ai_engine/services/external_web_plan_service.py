@@ -35,6 +35,7 @@ class ExternalWebPlanService:
         message,
         routing_plan,
         use_web=True,
+        previous_user_messages=None,
     ):
         routing = dict(routing_plan or {})
 
@@ -102,6 +103,16 @@ class ExternalWebPlanService:
 
         semantic_queries = []
 
+        message_for_search = str(message or "").strip()
+
+        message_words = message_for_search.split()
+
+        if len(message_words) <= 12 and previous_user_messages:
+            previous = str(list(previous_user_messages)[0] or "").strip()
+
+            if previous:
+                message_for_search = (f"{previous} " f"{message_for_search}").strip()
+
         if exact_title:
             semantic_queries.append(
                 cls._compose_query(
@@ -117,7 +128,7 @@ class ExternalWebPlanService:
         #
         semantic_queries.append(
             cls._compose_query(
-                message,
+                message_for_search,
                 requested_source,
             )
         )

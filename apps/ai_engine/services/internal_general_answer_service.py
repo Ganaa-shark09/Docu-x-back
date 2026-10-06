@@ -6,6 +6,11 @@ import requests
 
 from apps.ai_engine.services.external_ai_model_policy import ExternalAIModelPolicy
 
+from apps.ai_engine.services.internal_conversation_memory_service import (
+    InternalConversationMemoryService,
+)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -126,14 +131,9 @@ class InternalGeneralAnswerService:
         if conversation is None:
             return []
 
-        queryset = conversation.messages.filter(is_deleted=False)
-        if exclude_message_uuid:
-            queryset = queryset.exclude(uuid=exclude_message_uuid)
-        queryset = queryset.order_by("-created_at")[:4]
-
-        history = []
-        for item in reversed(list(queryset)):
-            if item.role not in {"user", "assistant"}:
-                continue
-            history.append({"role": item.role, "content": (item.content or "")[:1200]})
-        return history
+        return InternalConversationMemoryService.build_history_messages(
+            conversation=conversation,
+            user=conversation.user,
+            exclude_message_uuid=(exclude_message_uuid),
+            mode="answer",
+        )

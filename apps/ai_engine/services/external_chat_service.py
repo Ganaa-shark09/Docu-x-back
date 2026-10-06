@@ -35,6 +35,19 @@ from apps.ai_engine.services.external_web_search_service import (
 from apps.documents.models import Document
 
 
+from apps.ai_engine.services.external_web_answer_service import (
+    ExternalWebAnswerService,
+)
+
+
+from apps.ai_engine.services.external_conversation_context_service import (
+    ExternalConversationContextService,
+)
+from apps.ai_engine.services.external_conversation_summary_service import (
+    ExternalConversationSummaryService,
+)
+
+
 class ExternalChatService:
     @classmethod
     def _answer_semantic_fast(
@@ -214,6 +227,78 @@ class ExternalChatService:
         )
 
     @classmethod
+    def _answer_conversation_summary(
+        cls,
+        user,
+        conversation,
+        user_message,
+        message,
+        attached_document_uuids,
+    ):
+        llm_result = ExternalConversationSummaryService.generate(
+            user=user,
+            conversation=conversation,
+            current_user_message_uuid=(user_message.uuid),
+            message=message,
+        )
+
+        assistant_message = AIMessage.objects.create(
+            conversation=conversation,
+            role=AIMessage.Role.ASSISTANT,
+            content=llm_result["answer"],
+            retrieved_sources=[],
+            model_provider=(llm_result["provider"]),
+            model_name=(llm_result["model"]),
+            prompt_tokens=(
+                llm_result.get(
+                    "prompt_tokens",
+                    0,
+                )
+            ),
+            completion_tokens=(
+                llm_result.get(
+                    "completion_tokens",
+                    0,
+                )
+            ),
+            total_tokens=(
+                llm_result.get(
+                    "total_tokens",
+                    0,
+                )
+            ),
+            metadata={
+                "scope": Document.Scope.EXTERNAL,
+                "intent": "conversation_summary",
+                "semantic_action": "conversation_summary",
+                "conversation_memory": True,
+                "attached_document_uuids": [
+                    str(item) for item in attached_document_uuids
+                ],
+                "user_message_uuid": str(user_message.uuid),
+                "llm_metadata": llm_result.get(
+                    "metadata",
+                    {},
+                ),
+            },
+        )
+
+        conversation.save(update_fields=["updated_at"])
+
+        return cls._response(
+            conversation=conversation,
+            user_message=user_message,
+            assistant_message=(assistant_message),
+            sources=[],
+            web_results=[],
+            external_chunks=[],
+            processing_documents=[],
+            failed_documents=[],
+            search_warnings=[],
+            intent=("conversation_summary"),
+        )
+
+    @classmethod
     def chat(
         cls,
         user,
@@ -268,6 +353,22 @@ class ExternalChatService:
         # ---------------------------------------------------------
         # Semantic planning + possible direct answer
         # ---------------------------------------------------------
+        #
+        # Same-conversation memory operation.
+        #
+        # This is intentionally handled before semantic web/document
+        # routing because the requested source is the conversation
+        # itself.
+        #
+        if ExternalConversationContextService.is_summary_request(message):
+            return cls._answer_conversation_summary(
+                user=user,
+                conversation=conversation,
+                user_message=user_message,
+                message=message,
+                attached_document_uuids=(attached_document_uuids),
+            )
+
         plan = routing_plan or ExternalSemanticOrchestratorService.plan_resilient(
             message=message,
             conversation=conversation,
@@ -1070,15 +1171,26 @@ class ExternalChatService:
             }
 
         else:
-            llm_result = LLMGatewayService.generate_answer(
-                question=message,
-                retrieved_chunks=safe_document_chunks,
-                prompt=prompt,
-                provider_config=effective_provider_config,
-                allow_general_answer=True,
-                generation_options=generation_options,
-                allow_extractive_fallback=allow_extractive_fallback,
-            )
+            if ExternalWebAnswerService.should_handle(
+                web_results=web_results,
+                document_chunks=safe_document_chunks,
+            ):
+                llm_result = ExternalWebAnswerService.generate(
+                    question=message,
+                    web_results=web_results,
+                    provider_config=(effective_provider_config),
+                )
+
+            else:
+                llm_result = LLMGatewayService.generate_answer(
+                    question=message,
+                    retrieved_chunks=(safe_document_chunks),
+                    prompt=prompt,
+                    provider_config=(effective_provider_config),
+                    allow_general_answer=True,
+                    generation_options=(generation_options),
+                    allow_extractive_fallback=(allow_extractive_fallback),
+                )
 
         sources = cls._build_sources(
             document_chunks=safe_document_chunks,
@@ -1221,6 +1333,11 @@ class ExternalChatService:
                 "20. Never use prior assistant claims as evidence for a current fact.\n\n"
                 f"Intent: {intent}\n"
                 f"Document operation: {document_task}\n\n"
+                "For web answers, synthesize the supplied evidence into a useful answer. "
+                "Publisher-page evidence is strongest. Search-result-snippet evidence is secondary "
+                "and must be summarized conservatively without inventing details beyond the snippet. "
+                "When multiple web sources disagree, say so. "
+                "Never treat previous assistant messages as factual evidence.\n\n"
                 f"Context:\n{context}\n\n"
                 f"Question:\n{question}\n\n"
                 "Answer:"

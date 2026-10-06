@@ -1,7 +1,10 @@
+import logging
 import os
 
-from urllib.parse import (
-    urlsplit,
+from urllib.parse import urlsplit
+
+from apps.ai_engine.services.web_discovery_evidence_service import (
+    WebDiscoveryEvidenceService,
 )
 
 from apps.ai_engine.services.web_evidence_quality_service import (
@@ -12,6 +15,11 @@ from apps.ai_engine.services.web_page_retrieval_service import (
     WebPageRetrievalService,
 )
 
+from apps.ai_engine.services.web_search_fallback_provider_service import (
+    BingRSSSearchProvider,
+    DuckDuckGoLiteSearchProvider,
+)
+
 from apps.ai_engine.services.web_search_provider_service import (
     BraveSearchProvider,
     DuckDuckGoSearchProvider,
@@ -19,18 +27,20 @@ from apps.ai_engine.services.web_search_provider_service import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 class ExternalWebSearchService:
     """
-    Executes a semantic web-search plan across configured providers.
+    Public web evidence pipeline.
 
-    Semantic decisions are supplied by ExternalWebPlanService.
-
-    This layer owns only deterministic infrastructure:
-      - provider fan-out
-      - bounded query execution
-      - deduplication
-      - page retrieval
-      - evidence ranking
+    semantic plan
+      -> provider discovery cascade
+      -> dedupe
+      -> relevance ranking
+      -> publisher fetch
+      -> primary evidence
+      -> bounded discovery evidence fallback
     """
 
     @classmethod
@@ -50,14 +60,10 @@ class ExternalWebSearchService:
         if not queries:
             return {
                 "results": [],
-                "warnings": [
-                    (
-                        "The semantic web plan "
-                        "did not produce a usable "
-                        "search query."
-                    )
-                ],
+                "warnings": [("No usable web search " "query was produced.")],
+                "diagnostics": [],
                 "sufficient": False,
+                "evidence_mode": "none",
                 "executed_queries": [],
             }
 
@@ -84,8 +90,8 @@ class ExternalWebSearchService:
             ),
         )
 
-        combined_results = []
-        warnings = []
+        discovery = []
+        diagnostics = []
         executed_queries = []
 
         for query in queries[:max_queries]:
@@ -96,11 +102,38 @@ class ExternalWebSearchService:
                 max_results=discovery_limit,
             )
 
-            combined_results.extend(response["results"])
+            discovery.extend(response.get("results") or [])
 
-            warnings.extend(response["warnings"])
+            diagnostics.extend(response.get("warnings") or [])
 
-        deduped = cls._dedupe_results(combined_results)
+        discovery = cls._dedupe_results(discovery)
+
+        if not discovery:
+            diagnostics = cls._dedupe_strings(diagnostics)
+
+            logger.warning(
+                (
+                    "external_web_search_complete "
+                    "queries=%s discovery=0 "
+                    "fetched=0 selected=0 "
+                    "sufficient=False "
+                    "evidence_mode=none "
+                    "diagnostics=%s"
+                ),
+                len(executed_queries),
+                diagnostics,
+            )
+
+            return {
+                "results": [],
+                "warnings": [
+                    ("No public web search " "provider returned usable " "results.")
+                ],
+                "diagnostics": diagnostics,
+                "sufficient": False,
+                "evidence_mode": "none",
+                "executed_queries": executed_queries,
+            }
 
         fetch_limit = max(
             max_results,
@@ -112,31 +145,77 @@ class ExternalWebSearchService:
             ),
         )
 
-        discovery = WebEvidenceQualityService.rank_discovery(
-            results=deduped,
+        ranked = WebEvidenceQualityService.rank_discovery(
+            results=discovery,
             search_plan=plan,
             limit=fetch_limit,
         )
 
         enriched = WebPageRetrievalService.enrich_results(
-            discovery,
+            ranked,
             max_results=fetch_limit,
         )
 
-        warnings.extend(enriched["warnings"])
+        diagnostics.extend(enriched.get("warnings") or [])
 
-        selected = WebEvidenceQualityService.select(
-            results=enriched["results"],
+        primary = WebEvidenceQualityService.select(
+            results=enriched.get("results") or [],
             search_plan=plan,
             limit=max_results,
         )
 
-        warnings.extend(selected["warnings"])
+        diagnostics.extend(primary.get("warnings") or [])
+
+        if primary.get("sufficient"):
+            selected = primary
+
+            evidence_mode = "publisher_page"
+
+        else:
+            selected = WebDiscoveryEvidenceService.select(
+                discovery_results=ranked,
+                search_plan=plan,
+                limit=max_results,
+            )
+
+            diagnostics.extend(selected.get("warnings") or [])
+
+            evidence_mode = selected.get("evidence_mode") or "none"
+
+        selected_results = list(selected.get("results") or [])
+
+        sufficient = bool(selected.get("sufficient"))
+
+        fetched_count = sum(
+            1
+            for item in (enriched.get("results") or [])
+            if str(item.get("content") or "").strip()
+        )
+
+        diagnostics = cls._dedupe_strings(diagnostics)
+
+        logger.info(
+            (
+                "external_web_search_complete "
+                "queries=%s discovery=%s "
+                "fetched=%s selected=%s "
+                "sufficient=%s "
+                "evidence_mode=%s"
+            ),
+            len(executed_queries),
+            len(discovery),
+            fetched_count,
+            len(selected_results),
+            sufficient,
+            evidence_mode,
+        )
 
         return {
-            "results": selected["results"],
-            "warnings": cls._dedupe_strings(warnings),
-            "sufficient": bool(selected["sufficient"]),
+            "results": selected_results,
+            "warnings": ([] if sufficient else diagnostics),
+            "diagnostics": diagnostics,
+            "sufficient": sufficient,
+            "evidence_mode": evidence_mode,
             "executed_queries": executed_queries,
         }
 
@@ -161,10 +240,14 @@ class ExternalWebSearchService:
                 "warnings": [("Web search provider " "is disabled.")],
             }
 
-        searxng_base_url = os.getenv(
-            "SEARXNG_BASE_URL",
-            "",
-        ).strip()
+        searxng_url = (
+            os.getenv(
+                "SEARXNG_BASE_URL",
+                "",
+            )
+            .strip()
+            .rstrip("/")
+        )
 
         brave_key = os.getenv(
             "BRAVE_SEARCH_API_KEY",
@@ -174,27 +257,56 @@ class ExternalWebSearchService:
         results = []
         warnings = []
 
+        def merge(
+            name,
+            response,
+        ):
+            rows = list(response.get("results") or [])
+
+            provider_warnings = list(response.get("warnings") or [])
+
+            results.extend(rows)
+
+            warnings.extend(provider_warnings)
+
+            logger.info(
+                ("external_web_provider " "provider=%s results=%s"),
+                name,
+                len(rows),
+            )
+
+        #
+        # Preferred private/self-hosted search gateway.
+        #
         if (
             provider
             in {
                 "auto",
                 "searxng",
             }
-            and searxng_base_url
+            and searxng_url
         ):
-            response = SearXNGSearchProvider.search(
-                query=query,
-                max_results=max_results,
-                base_url=searxng_base_url,
+            merge(
+                "searxng",
+                SearXNGSearchProvider.search(
+                    query=query,
+                    max_results=max_results,
+                    base_url=searxng_url,
+                ),
             )
 
-            results.extend(response["results"])
+        if provider == "searxng":
+            if not searxng_url:
+                warnings.append(("SEARXNG_BASE_URL " "is not configured."))
 
-            warnings.extend(response["warnings"])
+            return {
+                "results": cls._dedupe_results(results)[:max_results],
+                "warnings": warnings,
+            }
 
-        elif provider == "searxng":
-            warnings.append(("SEARXNG_BASE_URL " "is not configured."))
-
+        #
+        # Optional managed search API.
+        #
         if (
             provider
             in {
@@ -202,41 +314,89 @@ class ExternalWebSearchService:
                 "brave",
             }
             and brave_key
+            and len(results) < max_results
         ):
-            response = BraveSearchProvider.search(
-                query=query,
-                max_results=max_results,
-                api_key=brave_key,
+            merge(
+                "brave",
+                BraveSearchProvider.search(
+                    query=query,
+                    max_results=max_results,
+                    api_key=brave_key,
+                ),
             )
 
-            results.extend(response["results"])
+        if provider == "brave":
+            if not brave_key:
+                warnings.append(("BRAVE_SEARCH_API_KEY " "is not configured."))
 
-            warnings.extend(response["warnings"])
-
-        elif provider == "brave":
-            warnings.append(("BRAVE_SEARCH_API_KEY " "is not configured."))
+            return {
+                "results": cls._dedupe_results(results)[:max_results],
+                "warnings": warnings,
+            }
 
         #
-        # DuckDuckGo HTML remains an infrastructure fallback.
-        # We intentionally call search_html() directly so the
-        # old keyword-based freshness heuristic is not involved
-        # in the active External AI path.
+        # Best-effort no-key transports.
         #
-        if provider in {
-            "auto",
-            "duckduckgo",
-        }:
-            response = DuckDuckGoSearchProvider.search_html(
-                query=query,
-                max_results=max_results,
+        if (
+            provider
+            in {
+                "auto",
+                "duckduckgo",
+            }
+            and len(results) < max_results
+        ):
+            merge(
+                "duckduckgo_html",
+                DuckDuckGoSearchProvider.search_html(
+                    query=query,
+                    max_results=max_results,
+                ),
             )
 
-            results.extend(response["results"])
+        if (
+            provider
+            in {
+                "auto",
+                "duckduckgo",
+            }
+            and len(results) < max_results
+        ):
+            merge(
+                "duckduckgo_lite",
+                DuckDuckGoLiteSearchProvider.search(
+                    query=query,
+                    max_results=max_results,
+                ),
+            )
 
-            warnings.extend(response["warnings"])
+        if provider == "duckduckgo":
+            return {
+                "results": cls._dedupe_results(results)[:max_results],
+                "warnings": warnings,
+            }
+
+        #
+        # Independent no-key fallback so DDG blocking does not
+        # collapse all public web capability.
+        #
+        if (
+            provider
+            in {
+                "auto",
+                "bing",
+            }
+            and len(results) < max_results
+        ):
+            merge(
+                "bing_rss",
+                BingRSSSearchProvider.search(
+                    query=query,
+                    max_results=max_results,
+                ),
+            )
 
         return {
-            "results": results,
+            "results": cls._dedupe_results(results)[:max_results],
             "warnings": warnings,
         }
 
@@ -247,15 +407,22 @@ class ExternalWebSearchService:
     ):
         candidates = list(search_plan.get("search_queries") or [])
 
-        fallback = str(fallback_query or "").strip()
+        #
+        # A semantic planner's queries are authoritative.
+        # Only fall back to the resolved/raw question when the
+        # planner did not produce any discovery query.
+        #
+        if not candidates:
+            resolved = str(search_plan.get("resolved_question") or "").strip()
 
-        #
-        # The fallback query exists for degraded plans.
-        # Do not add an extra network search when the
-        # semantic planner already supplied queries.
-        #
-        if not candidates and fallback:
-            candidates.append(fallback)
+            if resolved:
+                candidates.append(resolved)
+
+        if not candidates:
+            fallback = str(fallback_query or "").strip()
+
+            if fallback:
+                candidates.append(fallback)
 
         output = []
         seen = set()
@@ -291,16 +458,16 @@ class ExternalWebSearchService:
 
             parsed = urlsplit(url)
 
-            key = (
-                (
+            if parsed.scheme and parsed.netloc:
+                key = (
                     f"{parsed.scheme.lower()}"
                     f"://"
                     f"{parsed.netloc.lower()}"
                     f"{parsed.path.rstrip('/')}"
                 )
-                if (parsed.scheme and parsed.netloc)
-                else (url or str(item.get("title") or "").strip().casefold())
-            )
+
+            else:
+                key = url.casefold() or str(item.get("title") or "").strip().casefold()
 
             if not key or key in seen:
                 continue
@@ -318,14 +485,14 @@ class ExternalWebSearchService:
         output = []
         seen = set()
 
-        for value in values or []:
-            text = str(value or "").strip()
+        for raw in values or []:
+            value = str(raw or "").strip()
 
-            if not text or text in seen:
+            if not value or value in seen:
                 continue
 
-            seen.add(text)
+            seen.add(value)
 
-            output.append(text)
+            output.append(value)
 
         return output

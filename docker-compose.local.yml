@@ -17,6 +17,7 @@ services:
       - postgres
       - redis
       - ollama
+      - searxng
     networks:
       - docux_network
 
@@ -97,6 +98,18 @@ services:
       - "11434:11434"
     volumes:
       - docux_ollama_data:/root/.ollama
+    networks:
+      - docux_network
+
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: docux_searxng
+    restart: unless-stopped
+    volumes:
+      - ./docker/local/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    ports:
+      - "8081:8080"
     networks:
       - docux_network
 

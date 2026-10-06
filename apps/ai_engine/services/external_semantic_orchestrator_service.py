@@ -7,6 +7,16 @@ import requests
 
 from apps.ai_engine.services.external_ai_model_policy import ExternalAIModelPolicy
 
+from apps.ai_engine.services.external_web_routing_guard_service import (
+    ExternalWebRoutingGuardService,
+)
+
+
+from apps.ai_engine.services.external_conversation_context_service import (
+    ExternalConversationContextService,
+)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -397,6 +407,18 @@ class ExternalSemanticOrchestratorService:
         history. This removes stale assistant capability failures while preserving
         normal direct/web routing for unrelated questions.
         """
+        # Deterministic safety boundary for clearly live/public queries.
+        # Do not depend on a probabilistic routing model to decide
+        # whether obviously fresh information needs web evidence.
+        if (
+            use_web
+            and not has_attached_documents
+            and not has_explicit_documents
+            and not document_descriptors
+            and ExternalWebRoutingGuardService.requires_web(message)
+        ):
+            return ExternalWebRoutingGuardService.build_web_plan(message=message)
+
         first = cls.plan(
             message=message,
             conversation=conversation,
@@ -985,29 +1007,8 @@ web={use_web}
 
     @classmethod
     def _build_history(cls, conversation, current_user_message_uuid=None):
-        if conversation is None:
-            return []
-
-        queryset = conversation.messages.filter(is_deleted=False)
-        if current_user_message_uuid:
-            queryset = queryset.exclude(uuid=current_user_message_uuid)
-        queryset = queryset.order_by("-created_at")[:2]
-
-        history = []
-        for message in reversed(list(queryset)):
-            if message.role not in {"user", "assistant"}:
-                continue
-
-            # Failed capability clarifications such as "I cannot access the
-            # screenshot" must never become evidence for a later routing turn.
-            # They can create a self-reinforcing loop where a now-ready attachment
-            # is repeatedly classified as unavailable.
-            if (
-                message.role == "assistant"
-                and (message.metadata or {}).get("semantic_action")
-                == cls.ACTION_CLARIFY
-            ):
-                continue
-
-            history.append({"role": message.role, "content": message.content[:500]})
-        return history
+        return ExternalConversationContextService.build_history_messages(
+            conversation=conversation,
+            exclude_message_uuid=(current_user_message_uuid),
+            mode="routing",
+        )

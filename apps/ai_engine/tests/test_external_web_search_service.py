@@ -149,7 +149,92 @@ class ExternalWebSearchProviderFallbackTests(SimpleTestCase):
 
         search_html.assert_called_once()
 
-        self.assertEqual(
+        self.assertGreaterEqual(
             len(response["results"]),
             1,
+        )
+
+
+class ExternalWebSearchEvidenceFallbackTests(SimpleTestCase):
+    @patch(
+        (
+            "apps.ai_engine.services."
+            "external_web_search_service."
+            "WebPageRetrievalService."
+            "enrich_results"
+        )
+    )
+    @patch.object(
+        ExternalWebSearchService,
+        "_search_one",
+    )
+    def test_news_uses_search_evidence_when_page_fetch_fails(
+        self,
+        search_one,
+        enrich_results,
+    ):
+        search_one.return_value = {
+            "results": [
+                {
+                    "title": "Current Headline One",
+                    "snippet": ("Current news " "summary one."),
+                    "url": ("https://" "news.example/" "one"),
+                    "source": "search",
+                },
+                {
+                    "title": "Current Headline Two",
+                    "snippet": ("Current news " "summary two."),
+                    "url": ("https://" "news.example/" "two"),
+                    "source": "search",
+                },
+            ],
+            "warnings": [],
+        }
+
+        enrich_results.return_value = {
+            "results": [
+                {
+                    "title": "Current Headline One",
+                    "snippet": ("Current news " "summary one."),
+                    "url": ("https://" "news.example/" "one"),
+                    "content": "",
+                },
+                {
+                    "title": "Current Headline Two",
+                    "snippet": ("Current news " "summary two."),
+                    "url": ("https://" "news.example/" "two"),
+                    "content": "",
+                },
+            ],
+            "warnings": [("Publisher pages " "could not be read.")],
+        }
+
+        response = ExternalWebSearchService.search(
+            fallback_query="today news",
+            search_plan={
+                "needs_web": True,
+                "freshness": "current",
+                "query_type": "news",
+                "resolved_question": "today news",
+                "requested_source": "",
+                "exact_title": "",
+                "search_queries": ["today news"],
+            },
+            max_results=5,
+        )
+
+        self.assertTrue(response["sufficient"])
+
+        self.assertEqual(
+            response["evidence_mode"],
+            ("search_snippet_" "fallback"),
+        )
+
+        self.assertEqual(
+            response["warnings"],
+            [],
+        )
+
+        self.assertTrue(
+            response["diagnostics"],
         )

@@ -68,7 +68,21 @@ class ExternalAIModelPolicy:
 
     @classmethod
     def web_answer_model(cls):
-        return os.getenv("OLLAMA_WEB_ANSWER_MODEL", cls.quality_text_model())
+        # Web answering is evidence-grounded synthesis.
+        # Prefer the fast text model by default rather than
+        # running the large general reasoning model over
+        # multiple fetched pages.
+        return os.getenv(
+            "OLLAMA_WEB_ANSWER_MODEL",
+            cls.fast_text_model(),
+        )
+
+    @classmethod
+    def web_answer_fallback_model(cls):
+        return os.getenv(
+            "OLLAMA_WEB_ANSWER_FALLBACK_MODEL",
+            cls.fast_text_model(),
+        )
 
     @classmethod
     def summary_map_model(cls):

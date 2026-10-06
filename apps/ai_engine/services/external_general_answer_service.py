@@ -6,6 +6,11 @@ import requests
 
 from apps.ai_engine.services.external_ai_model_policy import ExternalAIModelPolicy
 
+from apps.ai_engine.services.external_conversation_context_service import (
+    ExternalConversationContextService,
+)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -400,30 +405,11 @@ class ExternalGeneralAnswerService:
 
     @staticmethod
     def build_history_messages(conversation, exclude_message_uuid=None):
-        if not conversation:
-            return []
-
-        queryset = conversation.messages.filter(is_deleted=False)
-
-        if exclude_message_uuid:
-            queryset = queryset.exclude(uuid=exclude_message_uuid)
-
-        queryset = queryset.order_by("-created_at")[:6]
-
-        messages = []
-
-        for message in reversed(list(queryset)):
-            if message.role not in ["user", "assistant"]:
-                continue
-
-            messages.append(
-                {
-                    "role": message.role,
-                    "content": message.content[:1400],
-                }
-            )
-
-        return messages
+        return ExternalConversationContextService.build_history_messages(
+            conversation=conversation,
+            exclude_message_uuid=(exclude_message_uuid),
+            mode="answer",
+        )
 
     @staticmethod
     def clean_answer(answer):

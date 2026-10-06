@@ -19,6 +19,14 @@ from apps.documents.models import Document
 from apps.vector_search.services import VectorSearchService
 
 
+from apps.ai_engine.services.internal_conversation_memory_service import (
+    InternalConversationMemoryService,
+)
+from apps.ai_engine.services.internal_conversation_summary_service import (
+    InternalConversationSummaryService,
+)
+
+
 class RAGChatService:
     @classmethod
     @transaction.atomic
@@ -39,6 +47,33 @@ class RAGChatService:
     ):
         if scope != Document.Scope.INTERNAL:
             raise ValueError("RAGChatService only supports Internal AI document scope.")
+
+        if InternalConversationMemoryService.is_summary_request(message):
+            conversation = cls._get_or_create_conversation(
+                user=user,
+                message=message,
+                conversation_uuid=(conversation_uuid),
+                department_uuid=(department_uuid),
+                scope=scope,
+            )
+
+            user_message = AIMessage.objects.create(
+                conversation=conversation,
+                role=AIMessage.Role.USER,
+                content=message,
+                metadata={
+                    "intent": "conversation_summary",
+                    "document_retrieval_skipped": True,
+                    "conversation_memory": True,
+                },
+            )
+
+            return cls._answer_conversation_summary(
+                user=user,
+                conversation=conversation,
+                user_message=user_message,
+                message=message,
+            )
 
         resolved_document_scope = InternalDocumentScopeService.resolve(
             user=user,
@@ -64,10 +99,22 @@ class RAGChatService:
             },
         )
 
+        memory_history = InternalConversationMemoryService.build_history_messages(
+            conversation=conversation,
+            user=user,
+            exclude_message_uuid=(user_message.uuid),
+            mode="routing",
+        )
+
+        retrieval_query = InternalConversationMemoryService.resolve_retrieval_query(
+            message=message,
+            history=memory_history,
+        )
+
         retrieved_chunks = VectorSearchService.search(
             company=user.company,
             user=user,
-            query=message,
+            query=retrieval_query,
             department_uuid=department_uuid,
             document_type=document_type,
             sensitivity_label=sensitivity_label,
@@ -77,7 +124,7 @@ class RAGChatService:
         )
 
         retrieved_chunks = InternalDocumentRelevanceService.filter_relevant_chunks(
-            question=message,
+            question=retrieval_query,
             retrieved_chunks=retrieved_chunks,
             force_document_scope=(
                 resolved_document_scope.mode == InternalDocumentScopeService.SELECTED
@@ -106,7 +153,7 @@ class RAGChatService:
             )
 
         prompt = PromptBuilderService.build_rag_prompt(
-            user_question=message,
+            user_question=retrieval_query,
             retrieved_chunks=safe_chunks,
             document_scope=resolved_document_scope.mode,
             selected_document_titles=resolved_document_scope.document_titles,
@@ -249,6 +296,86 @@ class RAGChatService:
                 "requested_provider_type": None,
                 "effective_provider_type": llm_result["provider"],
                 "forced_local": llm_result["provider"] == "ollama",
+                "allowed_count": 0,
+                "blocked_count": 0,
+                "redacted_count": 0,
+                "policy_actions": [],
+            },
+        }
+
+    @classmethod
+    def _answer_conversation_summary(
+        cls,
+        user,
+        conversation,
+        user_message,
+        message,
+    ):
+        llm_result = InternalConversationSummaryService.generate(
+            user=user,
+            conversation=conversation,
+            current_user_message_uuid=(user_message.uuid),
+            message=message,
+        )
+
+        assistant_message = AIMessage.objects.create(
+            conversation=conversation,
+            role=AIMessage.Role.ASSISTANT,
+            content=llm_result["answer"],
+            retrieved_sources=[],
+            model_provider=(llm_result["provider"]),
+            model_name=(llm_result["model"]),
+            prompt_tokens=(
+                llm_result.get(
+                    "prompt_tokens",
+                    0,
+                )
+            ),
+            completion_tokens=(
+                llm_result.get(
+                    "completion_tokens",
+                    0,
+                )
+            ),
+            total_tokens=(
+                llm_result.get(
+                    "total_tokens",
+                    0,
+                )
+            ),
+            metadata={
+                "intent": "conversation_summary",
+                "document_retrieval_skipped": True,
+                "conversation_memory": True,
+                "memory_access_revalidated": True,
+                "user_message_uuid": str(user_message.uuid),
+                "llm_metadata": llm_result.get(
+                    "metadata",
+                    {},
+                ),
+            },
+        )
+
+        conversation.save(update_fields=["updated_at"])
+
+        return {
+            "conversation": conversation,
+            "user_message": user_message,
+            "assistant_message": assistant_message,
+            "sources": [],
+            "document_context": {
+                "mode": "none",
+                "document_uuids": [],
+                "document_titles": [],
+                "accessible_document_count": 0,
+                "selected_document_count": 0,
+                "retrieval_skipped": True,
+                "conversation_memory": True,
+            },
+            "firewall": {
+                "requested_provider_type": "ollama",
+                "effective_provider_type": "ollama",
+                "forced_local": True,
                 "allowed_count": 0,
                 "blocked_count": 0,
                 "redacted_count": 0,
