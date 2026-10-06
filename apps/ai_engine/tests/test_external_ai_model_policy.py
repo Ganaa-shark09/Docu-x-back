@@ -24,7 +24,10 @@ class ExternalAIModelPolicyTests(SimpleTestCase):
             self.assertEqual(
                 ExternalAIModelPolicy.document_reasoning_model(), "qwen3:8b"
             )
-            self.assertEqual(ExternalAIModelPolicy.web_answer_model(), "qwen3:8b")
+            self.assertEqual(
+                ExternalAIModelPolicy.web_answer_model(),
+                ExternalAIModelPolicy.fast_text_model(),
+            )
             self.assertEqual(
                 ExternalAIModelPolicy.summary_map_model(), "qwen3:4b-instruct"
             )
