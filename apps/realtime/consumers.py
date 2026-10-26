@@ -150,13 +150,69 @@ class DocumentEventsConsumer(AsyncJsonWebsocketConsumer):
         )
 
     async def document_processing_update(self, event):
-        await self.send_json(event["payload"])
+        payload = event["payload"]
+        document_uuid = payload.get("document_uuid")
+        group = DocumentProcessingEventService.group_name(document_uuid)
+        if group not in self.document_groups:
+            return
+        # One bounded authorization lookup per processing-stage event, never a
+        # query per extracted field or streaming token. Refresh identity too:
+        # the connection's cached User does not reflect account revocation.
+        if not await self._event_authorized(document_uuid):
+            await self.channel_layer.group_discard(group, self.channel_name)
+            self.document_groups.discard(group)
+            await self.send_json(
+                {
+                    "event": "subscription.revoked",
+                    "event_version": 1,
+                    "document_uuid": document_uuid,
+                }
+            )
+            return
+        await self.send_json(payload)
+
+    @database_sync_to_async
+    def _event_authorized(self, document_uuid):
+        from apps.accounts.models import User
+
+        user = (
+            User.objects.select_related("company")
+            .filter(
+                pk=self.scope["user"].pk,
+                company_id=self.scope["user"].company_id,
+                is_active=True,
+                company__is_deleted=False,
+                company__status="active",
+            )
+            .first()
+        )
+        return bool(
+            user
+            and DocumentPermissionService.get_accessible_document_queryset(user)
+            .filter(uuid=document_uuid)
+            .exists()
+        )
 
     @database_sync_to_async
     def _authorized_documents(self, document_uuids):
+        from apps.accounts.models import User
+
+        user = (
+            User.objects.select_related("company")
+            .filter(
+                pk=self.scope["user"].pk,
+                company_id=self.scope["user"].company_id,
+                is_active=True,
+                company__is_deleted=False,
+                company__status="active",
+            )
+            .first()
+        )
+        if not user:
+            return []
         return list(
             DocumentPermissionService.get_accessible_document_queryset(
-                user=self.scope["user"],
+                user=user,
                 required_access="view",
             )
             .filter(uuid__in=document_uuids)

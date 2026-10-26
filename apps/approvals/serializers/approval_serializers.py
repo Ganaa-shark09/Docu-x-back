@@ -5,9 +5,20 @@ from apps.approvals.models import ApprovalComment, ApprovalRequest
 from apps.approvals.services import ApprovalWorkflowService
 from apps.documents.models import Document
 from apps.documents.services import DocumentPermissionService
+from apps.documents.services.field_permission_service import FieldPermissionService
 
 
 class ApprovalCommentSerializer(serializers.ModelSerializer):
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        if request and FieldPermissionService.has_restrictions(
+            request.user, instance.approval_request.document, "view"
+        ):
+            for key in ("comment", "old_value", "new_value"):
+                data[key] = FieldPermissionService.MASK
+        return data
+
     created_by_email = serializers.EmailField(source="created_by.email", read_only=True)
     created_by_username = serializers.CharField(
         source="created_by.username", read_only=True
@@ -39,6 +50,16 @@ class ApprovalCommentSerializer(serializers.ModelSerializer):
 
 
 class ApprovalRequestListSerializer(serializers.ModelSerializer):
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        if request and FieldPermissionService.has_restrictions(
+            request.user, instance.document, "view"
+        ):
+            data["description"] = ""
+            data["title"] = "Protected review"
+        return data
+
     document_uuid = serializers.UUIDField(source="document.uuid", read_only=True)
     document_title = serializers.CharField(source="document.title", read_only=True)
     requested_by_email = serializers.EmailField(
@@ -78,6 +99,22 @@ class ApprovalRequestListSerializer(serializers.ModelSerializer):
 
 
 class ApprovalRequestDetailSerializer(serializers.ModelSerializer):
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        if request and FieldPermissionService.has_restrictions(
+            request.user, instance.document, "view"
+        ):
+            data.update(
+                submitted_payload={},
+                reviewed_payload={},
+                reviewer_notes="",
+                comments=[],
+                description="",
+                title="Protected review",
+            )
+        return data
+
     document_uuid = serializers.UUIDField(source="document.uuid", read_only=True)
     document_title = serializers.CharField(source="document.title", read_only=True)
     requested_by_email = serializers.EmailField(
@@ -198,6 +235,13 @@ class ApprovalRequestCreateSerializer(serializers.Serializer):
 
 
 class ApprovalRequestUpdateSerializer(serializers.ModelSerializer):
+    def validate(self, attrs):
+        if getattr(self.instance, "workflow_step_run", None) is not None:
+            raise serializers.ValidationError(
+                "Use workflow commands for linked approval changes."
+            )
+        return attrs
+
     assigned_to = serializers.PrimaryKeyRelatedField(
         queryset=User.objects.all(),
         required=False,

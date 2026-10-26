@@ -2,6 +2,10 @@ from apps.ai_engine.models import LLMProviderConfig
 from apps.data_firewall.models import FirewallScan
 from apps.data_firewall.services.firewall_scan_service import FirewallScanService
 from apps.documents.models import Document
+from apps.documents.services import DocumentPermissionService
+from apps.documents.services.document_governance_service import (
+    DocumentGovernanceService,
+)
 
 
 class AIContextPolicyEnforcementService:
@@ -49,6 +53,14 @@ class AIContextPolicyEnforcementService:
                 is_deleted=False,
             ).select_related("company", "department")
         }
+        authorized = {
+            str(value)
+            for value in DocumentPermissionService.get_accessible_document_queryset(
+                user, require_ai=True
+            )
+            .filter(uuid__in=document_uuids)
+            .values_list("uuid", flat=True)
+        }
 
         firewall_scans = {
             str(scan.document.uuid): scan
@@ -80,6 +92,23 @@ class AIContextPolicyEnforcementService:
                     )
                 )
                 continue
+
+            if document_uuid not in authorized or (
+                chunk.get("governance_revision") is not None
+                and chunk["governance_revision"] != document.governance_revision
+            ):
+                blocked_count += 1
+                policy_actions.append(
+                    cls._action(
+                        chunk=chunk,
+                        document=document,
+                        action="blocked",
+                        reason="current_document_or_field_policy_denies_ai",
+                    )
+                )
+                continue
+
+            governance = DocumentGovernanceService.sensitivity(document)
 
             if scan and scan.requires_human_approval:
                 blocked_count += 1
@@ -119,10 +148,7 @@ class AIContextPolicyEnforcementService:
                     )
                 )
 
-            if (
-                is_cloud_provider
-                and document.sensitivity_label in cls.LOCAL_ONLY_SENSITIVITY_LABELS
-            ):
+            if is_cloud_provider and not governance["allow_cloud"]:
                 forced_local = True
                 policy_actions.append(
                     cls._action(
@@ -140,7 +166,7 @@ class AIContextPolicyEnforcementService:
                 is_cloud_provider
                 and not forced_local
                 and (
-                    document.sensitivity_label in cls.REDACT_FOR_CLOUD_LABELS
+                    governance["security_class"] in cls.REDACT_FOR_CLOUD_LABELS
                     or (
                         scan and scan.decision == FirewallScan.Decision.REDACT_AND_ALLOW
                     )

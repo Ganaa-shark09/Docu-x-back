@@ -1,10 +1,14 @@
 from apps.approvals.models import ApprovalRequest
 from apps.approvals.services import ApprovalWorkflowService
 from apps.workflows.models import ExtractionRun
+from django.db import transaction
+from rest_framework.exceptions import ValidationError
+from apps.documents.services import DocumentPermissionService
 
 
 class ExtractionApprovalService:
     @classmethod
+    @transaction.atomic
     def submit_for_approval(
         cls,
         user,
@@ -13,6 +17,25 @@ class ExtractionApprovalService:
         ip_address=None,
         user_agent="",
     ):
+        extraction_run = ExtractionRun.objects.select_for_update().get(
+            pk=extraction_run.pk, company=user.company, is_deleted=False
+        )
+        from apps.workflows.models import ContractReview
+
+        if ContractReview.objects.filter(extraction_run=extraction_run).exists():
+            raise ValidationError(
+                "Contract reviews use their workflow approval boundary."
+            )
+        DocumentPermissionService.require_action(
+            user, extraction_run.document, "workflow"
+        )
+        if extraction_run.status not in {
+            ExtractionRun.Status.SUCCESS,
+            ExtractionRun.Status.REVIEW_REQUIRED,
+        }:
+            raise ValidationError(
+                "Only completed extraction in review can be submitted."
+            )
         submitted_payload = {
             field.field_key: {
                 "label": field.label,

@@ -3,6 +3,7 @@ from rest_framework import permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.views import APIView
 
 from apps.ai_engine.models import AIConversation
@@ -14,6 +15,7 @@ from apps.ai_engine.services.external_semantic_orchestrator_service import (
     ExternalSemanticOrchestratorService,
 )
 from apps.documents.models import Document
+from apps.documents.permissions.document_permissions import IsCompanyDocumentUser
 from apps.documents.serializers.external_document_serializers import (
     ExternalDocumentSerializer,
     ExternalDocumentUploadSerializer,
@@ -213,6 +215,14 @@ class ExternalChatAPIView(APIView):
         )
 
         assistant_message = result["assistant_message"]
+        from apps.ai_engine.services.message_visibility_service import (
+            MessageVisibilityService,
+        )
+
+        if not MessageVisibilityService.visible(assistant_message, request.user):
+            raise PermissionDenied(
+                "Document access changed while generating this answer."
+            )
         routing_context = (result["user_message"].metadata or {}).get("routing", {})
 
         return Response(
@@ -245,7 +255,7 @@ class ExternalChatAPIView(APIView):
 
 
 class ExternalDocumentViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [IsCompanyDocumentUser]
     lookup_field = "uuid"
     parser_classes = [MultiPartParser, FormParser]
 
@@ -399,4 +409,10 @@ class ExternalDocumentViewSet(viewsets.ModelViewSet):
         return Response(result, status=status.HTTP_200_OK)
 
     def perform_destroy(self, instance):
-        instance.soft_delete()
+        from apps.documents.services.document_governance_service import (
+            DocumentGovernanceService,
+        )
+
+        DocumentGovernanceService.delete(
+            self.request.user, instance, request=self.request
+        )

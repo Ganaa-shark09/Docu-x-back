@@ -9,6 +9,14 @@ from apps.ai_engine.views.external_ai_views import ExternalChatAPIView
 
 class ExternalChatReadinessRoutingTests(SimpleTestCase):
     def setUp(self):
+        # Routing tests use service doubles; document authorization is covered
+        # separately with persisted messages and source documents.
+        visibility = patch(
+            "apps.ai_engine.services.message_visibility_service.MessageVisibilityService.visible",
+            return_value=True,
+        )
+        self.visibility = visibility.start()
+        self.addCleanup(visibility.stop)
         self.factory = APIRequestFactory()
         self.user = SimpleNamespace(
             is_authenticated=True,

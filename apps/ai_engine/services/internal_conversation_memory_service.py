@@ -169,7 +169,13 @@ class InternalConversationMemoryService:
 
         newest = list(queryset.order_by("-created_at")[: config["max_messages"]])
 
-        accessible_document_uuids = cls._accessible_document_uuids(user)
+        from apps.ai_engine.services.message_visibility_service import (
+            MessageVisibilityService,
+        )
+
+        allowed = MessageVisibilityService.allowed_documents(user, "internal")
+
+        accessible_document_uuids = set(allowed)
 
         rows = []
 
@@ -177,7 +183,9 @@ class InternalConversationMemoryService:
             rows.append(
                 {
                     "role": item.role,
-                    "content": item.content or "",
+                    "content": item.content or ""
+                    if MessageVisibilityService.visible(item, user, allowed)
+                    else cls.REVOKED_CONTEXT_MESSAGE,
                     "retrieved_sources": item.retrieved_sources or [],
                     "metadata": item.metadata or {},
                 }

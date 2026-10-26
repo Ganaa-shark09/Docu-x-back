@@ -8,4 +8,8 @@ __all__ = [
     "DocumentAccessPolicy",
     "DocumentProcessingJob",
     "DocumentVersion",
+    "DocumentFieldPolicy",
+    "RetentionPolicy",
+    "SensitivityPolicy",
 ]
+from .governance import DocumentFieldPolicy, RetentionPolicy, SensitivityPolicy

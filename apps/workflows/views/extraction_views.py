@@ -1,7 +1,16 @@
 from django.db.models import Q
-from rest_framework import filters, permissions, status, viewsets
+from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from django.db import transaction
+from rest_framework.exceptions import PermissionDenied
+from apps.audit.models import AuditLog
+from apps.audit.services import AuditLogService
+from apps.documents.services.field_permission_service import FieldPermissionService
+from apps.workflows.permissions.extraction_permissions import (
+    ExtractionPermission,
+    ExtractionTemplatePermission,
+)
 
 from apps.approvals.serializers import ApprovalRequestDetailSerializer
 from apps.documents.services import DocumentPermissionService
@@ -32,7 +41,7 @@ def get_client_ip(request):
 
 class ExtractionTemplateViewSet(viewsets.ModelViewSet):
     serializer_class = ExtractionTemplateSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [ExtractionTemplatePermission]
     lookup_field = "uuid"
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
     search_fields = ["name", "description", "template_type"]
@@ -51,22 +60,45 @@ class ExtractionTemplateViewSet(viewsets.ModelViewSet):
             .order_by("-is_system", "name")
         )
 
+    @transaction.atomic
     def perform_destroy(self, instance):
         instance.soft_delete()
+        self.log_template(instance, "delete")
+
+    def log_template(self, instance, operation):
+        AuditLogService.log(
+            company=self.request.user.company,
+            user=self.request.user,
+            event_type=AuditLog.EventType.GOVERNANCE_POLICY_CHANGED,
+            action="Extraction template changed.",
+            resource_type="extraction_template",
+            resource_uuid=instance.uuid,
+            metadata={"operation": operation},
+        )
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        self.log_template(serializer.save(), "create")
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        self.log_template(serializer.save(), "update")
 
     @action(detail=True, methods=["post"], url_path="fields")
+    @transaction.atomic
     def add_field(self, request, uuid=None):
         template = self.get_object()
 
         serializer = ExtractionTemplateFieldSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save(template=template)
+        self.log_template(template, "field_created")
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 class ExtractionRunViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [ExtractionPermission]
     lookup_field = "uuid"
 
     def get_queryset(self):
@@ -81,17 +113,33 @@ class ExtractionRunViewSet(viewsets.ModelViewSet):
             .prefetch_related("result_fields")
         )
 
-        if DocumentPermissionService.is_company_admin(user):
-            return queryset.order_by("-created_at")
-
         allowed_document_ids = (
             DocumentPermissionService.get_accessible_document_queryset(
                 user=user,
                 required_access="view",
-                require_ai=True,
             ).values_list("id", flat=True)
         )
 
+        from apps.workflows.models import WorkflowRun
+        from apps.workflows.permissions.workflow_permissions import (
+            WorkflowPermissionService,
+        )
+
+        visible_runs = WorkflowPermissionService.visible_runs(
+            user, WorkflowRun.objects.all()
+        ).values("pk")
+        queryset = queryset.filter(
+            Q(workflow_step_run__isnull=True)
+            | Q(workflow_step_run__run_id__in=visible_runs)
+        )
+        from apps.workflows.models import ContractReview
+
+        protected_ids = FieldPermissionService.denied_document_ids(user, "view")
+        queryset = queryset.exclude(
+            pk__in=ContractReview.objects.filter(document_id__in=protected_ids).values(
+                "extraction_run_id"
+            )
+        )
         return queryset.filter(document_id__in=allowed_document_ids).order_by(
             "-created_at"
         )
@@ -121,8 +169,34 @@ class ExtractionRunViewSet(viewsets.ModelViewSet):
         instance.soft_delete()
 
     @action(detail=True, methods=["post"], url_path="rerun")
+    @transaction.atomic
     def rerun(self, request, uuid=None):
         extraction_run = self.get_object()
+        from apps.workflows.models import ContractReview
+
+        if ContractReview.objects.filter(extraction_run=extraction_run).exists():
+            return Response(
+                {
+                    "detail": "Start a new workflow for a new contract extraction revision."
+                },
+                status=409,
+            )
+        extraction_run = ExtractionRun.objects.select_for_update().get(
+            pk=extraction_run.pk
+        )
+        DocumentPermissionService.require_action(
+            request.user, extraction_run.document, "extract"
+        )
+        if extraction_run.status in {
+            ExtractionRun.Status.APPROVED,
+            ExtractionRun.Status.SUBMITTED_FOR_APPROVAL,
+            ExtractionRun.Status.RUNNING,
+            ExtractionRun.Status.PENDING,
+        }:
+            return Response(
+                {"detail": "This extraction cannot be rerun in its current state."},
+                status=409,
+            )
 
         if not DocumentPermissionService.has_document_access(
             user=request.user,
@@ -157,7 +231,9 @@ class ExtractionRunViewSet(viewsets.ModelViewSet):
 
         from apps.workflows.tasks import run_structured_extraction_task
 
-        run_structured_extraction_task.delay(str(extraction_run.uuid))
+        transaction.on_commit(
+            lambda: run_structured_extraction_task.delay(str(extraction_run.uuid))
+        )
 
         return Response(
             {
@@ -250,6 +326,13 @@ class ExtractionRunViewSet(viewsets.ModelViewSet):
             return Response(
                 {"detail": "Extraction field not found."},
                 status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if not FieldPermissionService.field_allowed(
+            request.user, extraction_run.document, result_field.field_key
+        ):
+            raise PermissionDenied(
+                "Restricted fields cannot be corrected without view permission."
             )
 
         serializer = ExtractionFieldCorrectionSerializer(

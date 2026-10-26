@@ -18,7 +18,7 @@ from .image_understanding_service import ImageUnderstandingService
 
 class TextExtractionService:
     IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".webp"}
-    TEXT_EXTENSIONS = {".txt", ".csv", ".md", ".log"}
+    TEXT_EXTENSIONS = {".txt", ".csv", ".json", ".md", ".log"}
     DOCX_EXTENSIONS = {".docx"}
     EXCEL_EXTENSIONS = {".xlsx"}
 

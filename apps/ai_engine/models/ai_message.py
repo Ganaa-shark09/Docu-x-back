@@ -34,6 +34,25 @@ class AIMessage(BaseModel):
 
     metadata = models.JSONField(default=dict, blank=True)
 
+    def save(self, *args, **kwargs):
+        if self._state.adding:
+            from apps.ai_engine.services.message_visibility_service import (
+                MessageVisibilityService,
+            )
+
+            self.metadata = dict(self.metadata or {})
+            self.metadata["document_dependencies"] = MessageVisibilityService.capture(
+                self
+            )
+            from apps.ai_engine.services.internal_source_proof_service import (
+                InternalSourceProofService,
+            )
+
+            pins = InternalSourceProofService.capture(self)
+            if pins:
+                self.metadata["source_proof_pins"] = pins
+        return super().save(*args, **kwargs)
+
     def __str__(self):
         return f"{self.conversation.uuid} - {self.role}"
 

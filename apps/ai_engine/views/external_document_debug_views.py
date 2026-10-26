@@ -23,6 +23,18 @@ class ExternalDocumentExtractedTextAPIView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        from apps.documents.services import DocumentPermissionService
+        from apps.documents.services.field_permission_service import (
+            FieldPermissionService,
+        )
+
+        DocumentPermissionService.require_action(request.user, document, "view")
+        if FieldPermissionService.has_restrictions(request.user, document, "view"):
+            return Response(
+                {"detail": "Raw extracted text is protected by field policy."},
+                status=403,
+            )
+
         extraction = getattr(document, "text_extraction", None)
 
         if not extraction:

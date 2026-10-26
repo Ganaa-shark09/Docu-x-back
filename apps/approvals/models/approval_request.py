@@ -10,6 +10,7 @@ from apps.tenants.models import Company
 
 class ApprovalRequest(BaseModel):
     class ReviewType(models.TextChoices):
+        WORKFLOW_REVIEW = "workflow_review", "Workflow Review"
         DOCUMENT_REVIEW = "document_review", "Document Review"
         EXTRACTION_REVIEW = "extraction_review", "Extraction Review"
         FIREWALL_REVIEW = "firewall_review", "Firewall Review"

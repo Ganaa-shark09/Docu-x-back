@@ -29,6 +29,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "company_name",
             "company_slug",
             "role",
+            "is_superuser",
             "phone_number",
             "job_title",
             "is_email_verified",
@@ -43,6 +44,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
             "company_name",
             "company_slug",
             "role",
+            "is_superuser",
             "is_email_verified",
             "is_active",
         ]

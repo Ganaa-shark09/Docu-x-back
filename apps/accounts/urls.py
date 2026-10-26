@@ -1,5 +1,9 @@
 from django.urls import path
-
+from rest_framework.routers import DefaultRouter
+from apps.accounts.views.administration_views import (
+    ManagedCompanyViewSet,
+    ManagedUserViewSet,
+)
 from apps.accounts.views import (
     CSRFTokenAPIView,
     LoginAPIView,
@@ -7,6 +11,10 @@ from apps.accounts.views import (
     ProfileAPIView,
     RefreshCookieAPIView,
 )
+
+router = DefaultRouter()
+router.register("companies", ManagedCompanyViewSet, basename="managed-companies")
+router.register("users", ManagedUserViewSet, basename="managed-users")
 
 
 urlpatterns = [
@@ -42,3 +50,4 @@ urlpatterns = [
         name="auth-profile",
     ),
 ]
+urlpatterns += router.urls

@@ -1,4 +1,5 @@
 import hashlib
+import json
 import warnings
 import zipfile
 
@@ -39,6 +40,7 @@ class DocumentFileValidationService:
         ".tiff",
         ".txt",
         ".csv",
+        ".json",
         ".xlsx",
     }
 
@@ -54,6 +56,7 @@ class DocumentFileValidationService:
         ".tiff": "image/tiff",
         ".txt": "text/plain",
         ".csv": "text/csv",
+        ".json": "application/json",
         ".xlsx": (
             "application/vnd.openxmlformats-officedocument." "spreadsheetml.sheet"
         ),
@@ -101,6 +104,7 @@ class DocumentFileValidationService:
             "application/csv",
             "text/x-csv",
         },
+        ".json": {"application/json", "text/plain"},
     }
 
     OFFICE_REQUIRED_MEMBERS = {
@@ -182,6 +186,8 @@ class DocumentFileValidationService:
             ".csv",
         }:
             cls._validate_text_file(uploaded_file)
+        elif extension == ".json":
+            cls._validate_json_file(uploaded_file)
 
         canonical_mime = cls.CANONICAL_MIME_BY_EXTENSION[extension]
 
@@ -621,6 +627,33 @@ class DocumentFileValidationService:
             except Exception as exc:
                 raise ValidationError(("Image is malformed or " "unreadable.")) from exc
 
+        finally:
+            uploaded_file.seek(current_position)
+
+    @classmethod
+    def _validate_json_file(cls, uploaded_file):
+        current_position = uploaded_file.tell()
+
+        def unique_object(pairs):
+            result = dict(pairs)
+            if len(result) != len(pairs):
+                raise ValueError("Duplicate JSON fields")
+            return result
+
+        try:
+            uploaded_file.seek(0)
+            raw = uploaded_file.read(8388609)
+            if len(raw) > 8388608:
+                raise ValidationError("JSON documents must not exceed 8 MiB.")
+            value = json.loads(
+                raw.decode("utf-8-sig"),
+                object_pairs_hook=unique_object,
+                parse_constant=lambda _: (_ for _ in ()).throw(ValueError()),
+            )
+            if not isinstance(value, (dict, list)):
+                raise ValueError("A JSON document must contain an object or array")
+        except (ValueError, UnicodeError, RecursionError):
+            raise ValidationError("Malformed JSON document.")
         finally:
             uploaded_file.seek(current_position)
 

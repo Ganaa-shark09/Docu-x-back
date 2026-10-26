@@ -1,4 +1,7 @@
+from datetime import datetime, time, timedelta
+
 from django.db.models import Count, Q, Sum
+from django.db.models.functions import TruncDate
 from django.utils import timezone
 
 from apps.ai_engine.models import AIConversation, AIMessage
@@ -49,7 +52,29 @@ class DashboardAnalyticsService:
             "by_status": by_status,
             "by_type": by_type,
             "by_sensitivity": by_sensitivity,
+            "uploads_by_day": cls._daily_uploads(queryset),
         }
+
+    @staticmethod
+    def _daily_uploads(queryset):
+        today = timezone.localdate()
+        start = today - timedelta(days=29)
+        zone = timezone.get_current_timezone()
+        lower = timezone.make_aware(datetime.combine(start, time.min), zone)
+        upper = timezone.make_aware(
+            datetime.combine(today + timedelta(days=1), time.min), zone
+        )
+        days = {(start + timedelta(days=n)).isoformat(): 0 for n in range(30)}
+        rows = (
+            queryset.filter(created_at__gte=lower, created_at__lt=upper)
+            .annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(count=Count("id", distinct=True))
+            .order_by("day")
+        )
+        for row in rows:
+            days[row["day"].isoformat()] = row["count"]
+        return days
 
     @classmethod
     def get_approval_metrics(cls, user):

@@ -1,9 +1,14 @@
 from rest_framework import filters, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 
 from apps.notifications.models import Notification
 from apps.notifications.serializers import NotificationSerializer
+
+
+class NotificationPagination(PageNumberPagination):
+    page_size = 25
 
 
 class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
@@ -24,6 +29,14 @@ class NotificationViewSet(viewsets.ReadOnlyModelViewSet):
         "notification_type",
     ]
     ordering = ["-created_at"]
+    pagination_class = NotificationPagination
+
+    def paginate_queryset(self, queryset):
+        # Preserve the existing unpaginated contract for older clients. The
+        # drawer explicitly requests a page and receives a bounded envelope.
+        if "page" not in self.request.query_params:
+            return None
+        return super().paginate_queryset(queryset)
 
     def get_queryset(self):
         user = self.request.user

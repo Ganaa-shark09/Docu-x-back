@@ -1,16 +1,41 @@
 import re
+from types import SimpleNamespace
 from decimal import Decimal
 
 from django.db import transaction
 from django.utils import timezone
 
 from apps.workflows.models import ExtractionResultField, ExtractionRun
+from apps.documents.services import DocumentPermissionService
 
 
 class StructuredExtractionService:
     @classmethod
     @transaction.atomic
-    def run_extraction(cls, extraction_run):
+    def run_extraction(cls, extraction_run, field_specs=None):
+        locked = ExtractionRun.objects.select_for_update().get(pk=extraction_run.pk)
+        from apps.workflows.models import ContractReview
+
+        if ContractReview.objects.filter(extraction_run=locked).exists():
+            return locked
+        from apps.workflows.models import InvoiceRecord
+
+        if InvoiceRecord.objects.filter(extraction_run=locked).exists():
+            return locked
+        extraction_run.refresh_from_db()
+        if locked.status not in {
+            ExtractionRun.Status.PENDING,
+            ExtractionRun.Status.FAILED,
+        }:
+            return extraction_run
+        requester = extraction_run.requested_by
+        if requester:
+            requester.refresh_from_db()
+        if not requester or not DocumentPermissionService.can_action(
+            requester, extraction_run.document, "extract"
+        ):
+            extraction_run.mark_failed("Current document policy denies extraction.")
+            return extraction_run
         extraction_run.mark_running()
 
         document = extraction_run.document
@@ -24,6 +49,8 @@ class StructuredExtractionService:
         fields = extraction_run.template.fields.filter(is_deleted=False).order_by(
             "order"
         )
+        if field_specs is not None:
+            fields = [SimpleNamespace(**spec) for spec in field_specs]
 
         result_payload = {}
         confidence_values = []

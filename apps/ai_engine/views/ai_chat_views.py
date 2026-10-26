@@ -1,5 +1,6 @@
 from django.shortcuts import get_object_or_404
 from rest_framework import generics, permissions, status
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -50,6 +51,9 @@ class AIChatAPIView(APIView):
                 top_k=serializer.validated_data.get("top_k", 5),
                 ip_address=get_client_ip(request),
                 user_agent=request.META.get("HTTP_USER_AGENT", ""),
+                domain=serializer.validated_data.get("domain"),
+                policy_context=serializer.validated_data.get("policy_context"),
+                idempotency_key=serializer.validated_data.get("idempotency_key"),
             )
         except InternalDocumentScopeError as exc:
             payload = {
@@ -61,6 +65,14 @@ class AIChatAPIView(APIView):
             return Response(payload, status=status.HTTP_400_BAD_REQUEST)
 
         assistant_message = result["assistant_message"]
+        from apps.ai_engine.services.message_visibility_service import (
+            MessageVisibilityService,
+        )
+
+        if not MessageVisibilityService.visible(assistant_message, request.user):
+            raise PermissionDenied(
+                "Document access changed while generating this answer."
+            )
 
         return Response(
             {
@@ -77,6 +89,7 @@ class AIChatAPIView(APIView):
                     "completion_tokens": assistant_message.completion_tokens,
                     "total_tokens": assistant_message.total_tokens,
                 },
+                **({"policy": result["policy"]} if "policy" in result else {}),
             },
             status=status.HTTP_200_OK,
         )

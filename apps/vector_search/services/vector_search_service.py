@@ -74,6 +74,7 @@ class VectorSearchService:
                 {
                     "chunk_uuid": str(chunk.uuid),
                     "document_uuid": str(chunk.document.uuid),
+                    "governance_revision": chunk.document.governance_revision,
                     "document_title": chunk.document.title,
                     "document_filename": chunk.document.original_filename,
                     "document_mime_type": chunk.document.mime_type,

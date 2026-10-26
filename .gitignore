@@ -41,3 +41,5 @@ minio_data/
 .docux-backups/
 *.before-security
 docux_backend_phase*_fix.sh
+
+/.docux_dummy_credentials.json

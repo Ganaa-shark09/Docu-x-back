@@ -313,7 +313,9 @@ class OllamaLLMProvider:
             wall_duration_ms = round((time.perf_counter() - started_at) * 1000, 2)
             error_response = getattr(exc, "response", None)
             error_body = ""
-            if error_response is not None:
+            if error_response is not None and not generation_options.get(
+                "suppress_error_details"
+            ):
                 error_body = (getattr(error_response, "text", "") or "")[:1200]
 
             logger.warning(
@@ -323,7 +325,9 @@ class OllamaLLMProvider:
                 wall_duration_ms,
                 num_ctx,
                 max_tokens,
-                exc,
+                "provider_request_failed"
+                if generation_options.get("suppress_error_details")
+                else exc,
                 error_body,
             )
 

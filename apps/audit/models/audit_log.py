@@ -7,6 +7,19 @@ from apps.tenants.models import Company
 
 class AuditLog(BaseModel):
     class EventType(models.TextChoices):
+        WORKFLOW_EVENT = "workflow_event", "Workflow Event"
+        DOCUMENT_GOVERNANCE_CHANGED = (
+            "document_governance_changed",
+            "Document Governance Changed",
+        )
+        GOVERNANCE_POLICY_CHANGED = (
+            "governance_policy_changed",
+            "Governance Policy Changed",
+        )
+        DOCUMENT_PERMISSION_CHANGED = (
+            "document_permission_changed",
+            "Document Permission Changed",
+        )
         AI_CHAT_REQUEST = "ai_chat_request", "AI Chat Request"
         AI_CONTEXT_USED = "ai_context_used", "AI Context Used"
         AI_CONTEXT_REDACTED = "ai_context_redacted", "AI Context Redacted"

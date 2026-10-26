@@ -44,9 +44,23 @@ class RAGChatService:
         scope=Document.Scope.INTERNAL,
         ip_address=None,
         user_agent="",
+        domain=None,
+        policy_context=None,
+        idempotency_key=None,
     ):
         if scope != Document.Scope.INTERNAL:
             raise ValueError("RAGChatService only supports Internal AI document scope.")
+        if domain == "hr_policy":
+            from apps.workflows.services.hr_policy_qa_service import HRPolicyQAService
+
+            return HRPolicyQAService.chat(
+                user,
+                message,
+                context=policy_context,
+                conversation_uuid=conversation_uuid,
+                idempotency_key=idempotency_key,
+                top_k=top_k,
+            )
 
         if InternalConversationMemoryService.is_summary_request(message):
             conversation = cls._get_or_create_conversation(
@@ -431,6 +445,7 @@ class RAGChatService:
                 {
                     "chunk_uuid": chunk.get("chunk_uuid"),
                     "document_uuid": chunk.get("document_uuid"),
+                    "governance_revision": chunk.get("governance_revision"),
                     "document_title": chunk.get("document_title"),
                     "document_filename": chunk.get("document_filename"),
                     "document_mime_type": chunk.get("document_mime_type"),

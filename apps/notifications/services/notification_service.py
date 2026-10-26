@@ -160,6 +160,12 @@ class NotificationService:
         message,
         priority=Notification.Priority.NORMAL,
     ):
+        linked_step = getattr(approval_request, "workflow_step_run", None)
+        if linked_step is not None:
+            from apps.workflows.services.workflow_events import notify_workflow
+
+            return notify_workflow(linked_step.run, actor, notification_type)
+
         if not approval_request.requested_by:
             return None
 

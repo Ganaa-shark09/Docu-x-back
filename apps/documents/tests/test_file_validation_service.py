@@ -16,6 +16,44 @@ from apps.documents.services import (
 
 
 class DocumentFileValidationServiceTests(SimpleTestCase):
+    def test_valid_json_is_accepted_and_rewound(self):
+        uploaded = SimpleUploadedFile(
+            "finance.json",
+            b'[{"gross_amount":"100.01"}]',
+            content_type="application/octet-stream",
+        )
+        self.assertEqual(
+            DocumentFileValidationService.validate_file(uploaded), "application/json"
+        )
+        self.assertEqual(uploaded.tell(), 0)
+
+    def test_json_duplicate_keys_rejected(self):
+        uploaded = SimpleUploadedFile("finance.json", b'{"amount":"100","amount":"0"}')
+        with self.assertRaises(ValidationError):
+            DocumentFileValidationService.validate_file(uploaded)
+
+    def test_json_nonfinite_rejected(self):
+        uploaded = SimpleUploadedFile("finance.json", b'{"amount":NaN}')
+        with self.assertRaises(ValidationError):
+            DocumentFileValidationService.validate_file(uploaded)
+
+    def test_json_primitive_rejected(self):
+        uploaded = SimpleUploadedFile("finance.json", b'"plain text"')
+        with self.assertRaises(ValidationError):
+            DocumentFileValidationService.validate_file(uploaded)
+
+    def test_json_malformed_rejected(self):
+        uploaded = SimpleUploadedFile("finance.json", b'{"amount":')
+        with self.assertRaises(ValidationError):
+            DocumentFileValidationService.validate_file(uploaded)
+
+    def test_json_size_bounded(self):
+        uploaded = SimpleUploadedFile(
+            "finance.json", b'{"text":"' + b"x" * 8388608 + b'"}'
+        )
+        with self.assertRaises(ValidationError):
+            DocumentFileValidationService.validate_file(uploaded)
+
     def test_valid_pdf_is_accepted(self):
         buffer = io.BytesIO()
 

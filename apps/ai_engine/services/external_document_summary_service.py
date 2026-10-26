@@ -980,6 +980,7 @@ class ExternalDocumentSummaryService:
         return {
             "source_type": "external_document",
             "document_uuid": str(document.uuid),
+            "governance_revision": getattr(document, "governance_revision", None),
             "document_title": document.title,
             "chunk_index": None,
             "score": 1.0,

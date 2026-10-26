@@ -126,9 +126,24 @@ class ExternalConversationContextService:
         #
         newest = list(queryset.order_by("-created_at")[: config["max_messages"]])
 
+        from apps.ai_engine.models import AIConversation
+        from apps.ai_engine.services.message_visibility_service import (
+            MessageVisibilityService,
+        )
+
+        allowed = None
+        if isinstance(conversation, AIConversation):
+            allowed = MessageVisibilityService.allowed_documents(
+                conversation.user, "external"
+            )
+
         rows = []
 
         for message in reversed(newest):
+            if allowed is not None and not MessageVisibilityService.visible(
+                message, conversation.user, allowed
+            ):
+                continue
             metadata = message.metadata or {}
 
             #

@@ -2,6 +2,7 @@ import re
 
 from apps.ai_engine.models import AIConversationDocument
 from apps.documents.models import Document
+from apps.documents.services import DocumentPermissionService
 
 
 class ExternalExtractiveQAService:
@@ -68,6 +69,9 @@ class ExternalExtractiveQAService:
                         {
                             "source_type": "external_document",
                             "document_uuid": str(document.uuid),
+                            "governance_revision": getattr(
+                                document, "governance_revision", None
+                            ),
                             "document_title": document.title,
                             "chunk_index": 0,
                             "score": 1.0,
@@ -96,6 +100,13 @@ class ExternalExtractiveQAService:
 
     @classmethod
     def get_candidate_documents(cls, user, conversation, explicit_document_uuids=None):
+        if (
+            conversation.company_id != user.company_id
+            or conversation.user_id != user.pk
+            or conversation.scope != "external"
+            or conversation.is_deleted
+        ):
+            return []
         queryset = Document.objects.filter(
             company=user.company,
             uploaded_by=user,
@@ -105,6 +116,10 @@ class ExternalExtractiveQAService:
         ).exclude(
             status=Document.Status.FAILED,
         )
+        permitted = DocumentPermissionService.get_accessible_document_queryset(
+            user, scope=Document.Scope.EXTERNAL, require_ai=True
+        ).values("pk")
+        queryset = queryset.filter(pk__in=permitted)
 
         if explicit_document_uuids:
             return list(

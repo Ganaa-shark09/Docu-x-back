@@ -2,6 +2,7 @@ from django.db.models import Q
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 
 from apps.approvals.models import ApprovalRequest
 from apps.approvals.permissions import IsApprovalWorkflowUser
@@ -64,10 +65,27 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
             )
             .prefetch_related("comments")
         )
+        from apps.workflows.models import WorkflowRun
+        from apps.workflows.permissions.workflow_permissions import (
+            WorkflowPermissionService,
+        )
+
+        visible_runs = WorkflowPermissionService.visible_runs(
+            user, WorkflowRun.objects.all()
+        ).values("pk")
+        queryset = queryset.filter(
+            Q(workflow_step_run__isnull=True)
+            | Q(workflow_step_run__run_id__in=visible_runs)
+        )
+        allowed_documents = DocumentPermissionService.get_accessible_document_queryset(
+            user
+        ).values("pk")
+        queryset = queryset.filter(document_id__in=allowed_documents)
 
         if not DocumentPermissionService.is_company_admin(user):
             queryset = queryset.filter(
-                Q(requested_by=user)
+                Q(workflow_step_run__run_id__in=visible_runs)
+                | Q(requested_by=user)
                 | Q(assigned_to=user)
                 | Q(reviewed_by=user)
                 | Q(document__uploaded_by=user)
@@ -94,6 +112,14 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
         if assigned_to_me and assigned_to_me.lower() in ["true", "1", "yes"]:
             queryset = queryset.filter(assigned_to=user)
 
+        from apps.documents.services.field_permission_service import (
+            FieldPermissionService,
+        )
+
+        restricted_ids = FieldPermissionService.denied_document_ids(user, "view")
+        queryset = queryset.exclude(
+            workflow_step_run__run__document_links__document_id__in=restricted_ids
+        )
         return queryset.distinct()
 
     def get_serializer_class(self):
@@ -126,6 +152,8 @@ class ApprovalRequestViewSet(viewsets.ModelViewSet):
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
 
     def perform_destroy(self, instance):
+        if getattr(instance, "workflow_step_run", None) is not None:
+            raise PermissionDenied("Cancel the workflow through a workflow command.")
         instance.soft_delete()
 
     @action(detail=True, methods=["post"], url_path="approve")

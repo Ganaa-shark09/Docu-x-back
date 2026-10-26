@@ -227,7 +227,7 @@ class ExternalWebSearchEvidenceFallbackTests(SimpleTestCase):
 
         self.assertEqual(
             response["evidence_mode"],
-            ("search_snippet_" "fallback"),
+            "search_discovery",
         )
 
         self.assertEqual(

@@ -1,6 +1,14 @@
 from pathlib import Path as FilePath
 
 from rest_framework import serializers
+from django.db import transaction
+from apps.documents.services.document_governance_service import (
+    DocumentGovernanceService,
+)
+from apps.documents.services.field_permission_service import FieldPermissionService
+from apps.documents.serializers.governance_serializers import (
+    DocumentGovernanceSerializer,
+)
 from rest_framework.reverse import reverse
 
 from apps.data_firewall.models import FirewallScan
@@ -93,8 +101,12 @@ class DocumentAccessPolicySerializer(serializers.ModelSerializer):
         user = attrs.get("user")
         role = attrs.get("role")
 
-        if not user and not role:
-            raise serializers.ValidationError("Either user or role is required.")
+        from apps.accounts.models import User
+
+        if bool(user) == bool(role):
+            raise serializers.ValidationError("Exactly one user or role is required.")
+        if role and role not in User.Role.values:
+            raise serializers.ValidationError({"role": "Unsupported grant role."})
 
         return attrs
 
@@ -255,6 +267,40 @@ class InternalAIDocumentListSerializer(serializers.ModelSerializer):
 
 
 class DocumentDetailSerializer(serializers.ModelSerializer):
+    governance = DocumentGovernanceSerializer(source="*", read_only=True)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        if request:
+            data["file"] = (
+                request.build_absolute_uri(
+                    reverse("documents-preview", kwargs={"uuid": instance.uuid})
+                )
+                + f"?scope={instance.scope}"
+                if DocumentPermissionService.can_action(
+                    request.user, instance, "download"
+                )
+                else None
+            )
+            if FieldPermissionService.has_restrictions(request.user, instance, "view"):
+                for key in (
+                    "text_extraction",
+                    "firewall_scan",
+                    "processing_error",
+                    "processing_jobs",
+                ):
+                    data[key] = (
+                        None
+                        if key in {"text_extraction", "firewall_scan"}
+                        else ""
+                        if key == "processing_error"
+                        else []
+                    )
+            for version in data.get("versions", []):
+                version["file"] = None
+        return data
+
     company_name = serializers.CharField(source="company.name", read_only=True)
     department_name = serializers.CharField(source="department.name", read_only=True)
     uploaded_by_email = serializers.EmailField(
@@ -278,6 +324,7 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
             "department_name",
             "uploaded_by_email",
             "current_user_access",
+            "governance",
             "document_type",
             "status",
             "processing_stage",
@@ -368,12 +415,27 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
         if not department:
             raise serializers.ValidationError("Department not found for your company.")
 
+        if not DocumentPermissionService.is_company_admin(
+            request.user
+        ) and department.pk not in DocumentPermissionService.get_user_department_ids(
+            request.user, "edit"
+        ):
+            raise serializers.ValidationError(
+                "Edit access to the department is required."
+            )
+
         return department
 
     def validate_file(self, uploaded_file):
         DocumentFileValidationService.validate_file(uploaded_file)
         return uploaded_file
 
+    def validate_sensitivity_label(self, value):
+        return DocumentGovernanceService.validate_label(
+            self.context["request"].user.company, value
+        )
+
+    @transaction.atomic
     def create(self, validated_data):
         request = self.context["request"]
         uploaded_file = validated_data["file"]
@@ -415,6 +477,34 @@ class DocumentCreateSerializer(serializers.ModelSerializer):
 
 
 class DocumentUpdateSerializer(serializers.ModelSerializer):
+    def validate_sensitivity_label(self, value):
+        return DocumentGovernanceService.validate_label(
+            self.context["request"].user.company, value
+        )
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        request = self.context["request"]
+        DocumentPermissionService.require_action(request.user, instance, "edit")
+        governance = {
+            key: validated_data.pop(key)
+            for key in ("department", "sensitivity_label")
+            if key in validated_data
+        }
+        if governance:
+            instance = DocumentGovernanceService.update(
+                request.user, instance, governance, request=request
+            )
+        if "status" in validated_data and validated_data["status"] != instance.status:
+            if (
+                not DocumentPermissionService.is_company_admin(request.user)
+                or validated_data["status"] != Document.Status.ARCHIVED
+            ):
+                raise serializers.ValidationError(
+                    {"status": "Only administrators can archive through this endpoint."}
+                )
+        return super().update(instance, validated_data)
+
     class Meta:
         model = Document
         fields = [

@@ -51,6 +51,20 @@ class ExternalDocumentUploadService:
         document_type=None,
         sensitivity_label=None,
     ):
+        from apps.documents.services.document_governance_service import (
+            DocumentGovernanceService,
+        )
+
+        DocumentGovernanceService.validate_label(
+            user.company, sensitivity_label or Document.Sensitivity.INTERNAL
+        )
+        if conversation is not None and (
+            conversation.company_id != user.company_id
+            or conversation.user_id != user.pk
+            or conversation.scope != "external"
+            or conversation.is_deleted
+        ):
+            raise ValueError("External conversation is not available.")
         detected_mime_type = DocumentFileValidationService.validate_file(uploaded_file)
 
         conversation = conversation or cls.get_or_create_external_conversation(

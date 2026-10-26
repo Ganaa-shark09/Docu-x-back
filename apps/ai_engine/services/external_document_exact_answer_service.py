@@ -91,6 +91,9 @@ class ExternalDocumentExactAnswerService:
                 {
                     "source_type": "external_document",
                     "document_uuid": str(document.uuid),
+                    "governance_revision": getattr(
+                        document, "governance_revision", None
+                    ),
                     "document_title": document.title,
                     "chunk_index": position - 1,
                     "score": 1.0,
@@ -152,6 +155,15 @@ class ExternalDocumentExactAnswerService:
 
     @classmethod
     def get_candidate_documents(cls, user, conversation, explicit_document_uuids=None):
+        from apps.documents.services import DocumentPermissionService
+
+        if (
+            conversation.company_id != user.company_id
+            or conversation.user_id != user.pk
+            or conversation.scope != "external"
+            or conversation.is_deleted
+        ):
+            return []
         queryset = Document.objects.filter(
             company=user.company,
             uploaded_by=user,
@@ -159,6 +171,11 @@ class ExternalDocumentExactAnswerService:
             is_deleted=False,
             is_ai_ready=True,
         ).exclude(status=Document.Status.FAILED)
+
+        permitted = DocumentPermissionService.get_accessible_document_queryset(
+            user, scope=Document.Scope.EXTERNAL, ai_policy_only=True
+        ).values("pk")
+        queryset = queryset.filter(pk__in=permitted)
 
         if explicit_document_uuids:
             return list(

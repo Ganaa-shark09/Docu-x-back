@@ -1,7 +1,9 @@
 from django.db.models import Q
+from django.utils import timezone
+from rest_framework.exceptions import PermissionDenied
 
 from apps.accounts.models import User
-from apps.documents.models import Document, DocumentAccessPolicy
+from apps.documents.models import Document, DocumentAccessPolicy, SensitivityPolicy
 from apps.workspaces.models import DepartmentMembership
 
 
@@ -36,7 +38,7 @@ class DocumentPermissionService:
 
     @classmethod
     def get_allowed_access_levels(cls, required_access):
-        required_rank = cls.ACCESS_ORDER.get(required_access, 1)
+        required_rank = cls.ACCESS_ORDER.get(required_access, 999)
 
         return [
             access_level
@@ -71,6 +73,8 @@ class DocumentPermissionService:
                 user=user,
                 is_active=True,
                 is_deleted=False,
+                department__is_deleted=False,
+                department__is_active=True,
                 role__in=allowed_department_roles,
             ).values_list("department_id", flat=True)
         )
@@ -82,11 +86,15 @@ class DocumentPermissionService:
         required_access=DocumentAccessPolicy.AccessLevel.VIEW,
         require_ai=False,
         scope=None,
+        ai_policy_only=False,
     ):
         if (
             not user
             or not user.is_authenticated
+            or not user.is_active
             or not getattr(user, "company_id", None)
+            or user.company.is_deleted
+            or user.company.status != "active"
         ):
             return Document.objects.none()
 
@@ -95,11 +103,72 @@ class DocumentPermissionService:
             is_deleted=False,
         )
 
+        # Expiration limits access even on legal hold; a hold prevents deletion,
+        # not access revocation. Administrators retain metadata access for disposition.
+        if not cls.is_company_admin(user):
+            base_queryset = base_queryset.filter(
+                Q(retention_expires_at__isnull=True)
+                | Q(retention_expires_at__gt=timezone.now())
+            )
+
         if scope:
             base_queryset = base_queryset.filter(scope=scope)
 
-        if require_ai:
-            base_queryset = base_queryset.filter(is_ai_ready=True)
+        if require_ai or ai_policy_only:
+            from apps.documents.services.field_permission_service import (
+                FieldPermissionService,
+            )
+
+            base_queryset = base_queryset.exclude(status=Document.Status.ARCHIVED)
+            if require_ai:
+                base_queryset = base_queryset.filter(is_ai_ready=True)
+            base_queryset = base_queryset.filter(
+                Q(retention_expires_at__isnull=True)
+                | Q(retention_expires_at__gt=timezone.now())
+            )
+            base_queryset = base_queryset.exclude(
+                pk__in=FieldPermissionService.denied_document_ids(user, "ai")
+            )
+            base_queryset = base_queryset.exclude(
+                pk__in=FieldPermissionService.denied_document_ids(user, "view")
+            )
+            denied = (
+                DocumentAccessPolicy.objects.filter(
+                    document__company=user.company, is_deleted=False, can_use_ai=False
+                )
+                .filter(Q(user=user) | Q(user__isnull=True, role=user.role))
+                .values("document_id")
+            )
+            base_queryset = base_queryset.exclude(pk__in=denied)
+            base_queryset = base_queryset.exclude(
+                sensitivity_label__in=SensitivityPolicy.objects.filter(
+                    company=user.company, is_deleted=False
+                )
+                .filter(Q(allow_ai=False) | Q(is_active=False))
+                .values("code")
+            )
+            base_queryset = base_queryset.filter(
+                Q(sensitivity_label__in=Document.Sensitivity.values)
+                | Q(
+                    sensitivity_label__in=SensitivityPolicy.objects.filter(
+                        company=user.company,
+                        is_deleted=False,
+                        is_active=True,
+                        security_class__in=Document.Sensitivity.values,
+                    ).values("code")
+                )
+            )
+
+        # Sensitivity policies can require stronger access even for list/retrieval.
+        for policy in SensitivityPolicy.objects.filter(
+            company=user.company, is_deleted=False
+        ).exclude(minimum_access="view"):
+            if not cls.is_company_admin(user):
+                allowed = cls._access_query(user, policy.minimum_access)
+                permitted_ids = Document.objects.filter(allowed).values("pk")
+                base_queryset = base_queryset.exclude(
+                    Q(sensitivity_label=policy.code) & ~Q(pk__in=permitted_ids)
+                )
 
         # External documents are user-private by default.
         if scope == Document.Scope.EXTERNAL:
@@ -123,7 +192,7 @@ class DocumentPermissionService:
         )
 
         internal_access_query = Q(scope=Document.Scope.INTERNAL) & (
-            Q(uploaded_by=user)
+            cls._ownership_query(user)
             | Q(department_id__in=department_ids)
             | Q(
                 access_policies__user=user,
@@ -131,6 +200,7 @@ class DocumentPermissionService:
                 access_policies__is_deleted=False,
             )
             | Q(
+                access_policies__user__isnull=True,
                 access_policies__role=user.role,
                 access_policies__access_level__in=allowed_access_levels,
                 access_policies__is_deleted=False,
@@ -139,13 +209,14 @@ class DocumentPermissionService:
 
         external_access_query = Q(scope=Document.Scope.EXTERNAL, uploaded_by=user)
 
-        if require_ai:
+        if require_ai or ai_policy_only:
             explicit_ai_query = Q(
                 access_policies__user=user,
                 access_policies__access_level__in=allowed_access_levels,
                 access_policies__can_use_ai=True,
                 access_policies__is_deleted=False,
             ) | Q(
+                access_policies__user__isnull=True,
                 access_policies__role=user.role,
                 access_policies__access_level__in=allowed_access_levels,
                 access_policies__can_use_ai=True,
@@ -153,7 +224,7 @@ class DocumentPermissionService:
             )
 
             internal_access_query = Q(scope=Document.Scope.INTERNAL) & (
-                Q(uploaded_by=user)
+                cls._ownership_query(user)
                 | Q(department_id__in=department_ids)
                 | explicit_ai_query
             )
@@ -161,6 +232,129 @@ class DocumentPermissionService:
         return base_queryset.filter(
             internal_access_query | external_access_query
         ).distinct()
+
+    @staticmethod
+    def _ownership_query(user):
+        # Preserve legacy uploader authority only while no explicit owner exists.
+        return Q(owner_user=user) | Q(owner_user__isnull=True, uploaded_by=user)
+
+    @classmethod
+    def _access_query(cls, user, level):
+        levels = cls.get_allowed_access_levels(level)
+        return (
+            cls._ownership_query(user)
+            | Q(department_id__in=cls.get_user_department_ids(user, level))
+            | Q(
+                access_policies__is_deleted=False,
+                access_policies__access_level__in=levels,
+                access_policies__user=user,
+            )
+            | Q(
+                access_policies__is_deleted=False,
+                access_policies__access_level__in=levels,
+                access_policies__user__isnull=True,
+                access_policies__role=user.role,
+            )
+        )
+
+    @classmethod
+    def can_action(cls, user, document, action):
+        from apps.documents.services.document_governance_service import (
+            DocumentGovernanceService,
+        )
+        from apps.documents.services.field_permission_service import (
+            FieldPermissionService,
+        )
+
+        levels = {
+            "governance_read": "view",
+            "view": "view",
+            "download": "view",
+            "edit": "edit",
+            "delete": "admin",
+            "ai": "view",
+            "extract": "review",
+            "correct": "review",
+            "export": "view",
+            "workflow": "review",
+            "administer": "admin",
+        }
+        if (
+            action not in levels
+            or not document
+            or document.company_id != getattr(user, "company_id", None)
+        ):
+            return False
+        if not cls.has_document_access(
+            user,
+            document,
+            levels[action],
+            require_ai=action in {"ai", "extract", "workflow"},
+        ):
+            return False
+        if action == "governance_read":
+            return cls.is_company_admin(user) or not DocumentGovernanceService.expired(
+                document
+            )
+        if action == "view" and DocumentGovernanceService.expired(document):
+            return False
+        if action == "delete" and (
+            document.legal_hold
+            or not DocumentGovernanceService.deletion_eligible(document)
+        ):
+            return False
+        if action in {
+            "edit",
+            "correct",
+            "extract",
+            "workflow",
+            "export",
+            "download",
+            "ai",
+        } and (
+            DocumentGovernanceService.expired(document)
+            or document.status == Document.Status.ARCHIVED
+        ):
+            return False
+        rules = DocumentAccessPolicy.objects.filter(
+            document=document, is_deleted=False
+        ).filter(Q(user=user) | Q(user__isnull=True, role=user.role))
+        if action in {"download", "export", "ai", "extract"}:
+            flag = {
+                "download": "can_download",
+                "export": "can_export",
+                "ai": "can_use_ai",
+                "extract": "can_use_ai",
+            }[action]
+            if rules.filter(**{flag: False}).exists():
+                return False
+        if action in {"ai", "extract", "export"}:
+            policy = DocumentGovernanceService.sensitivity(document)
+            if not policy["allow_export" if action == "export" else "allow_ai"]:
+                return False
+        if action == "export":
+            if FieldPermissionService.has_restrictions(user, document, "export"):
+                return False
+            if not (
+                cls.is_company_admin(user)
+                or document.owner_user_id == user.pk
+                or (
+                    document.owner_user_id is None
+                    and document.uploaded_by_id == user.pk
+                )
+                or rules.filter(can_export=True).exists()
+            ):
+                return False
+        if action == "download" and FieldPermissionService.has_restrictions(
+            user, document, "view"
+        ):
+            return False
+        return True
+
+    @classmethod
+    def require_action(cls, user, document, action):
+        if not cls.can_action(user, document, action):
+            raise PermissionDenied(f"Document action '{action}' is not permitted.")
 
     @classmethod
     def has_document_access(
@@ -186,52 +380,12 @@ class DocumentPermissionService:
 
     @classmethod
     def can_download_document(cls, user, document, assume_view_access=False):
-        if not document:
-            return False
-
-        if not assume_view_access and not cls.has_document_access(
-            user=user,
-            document=document,
-            required_access=DocumentAccessPolicy.AccessLevel.VIEW,
-        ):
-            return False
-
-        if cls.is_company_admin(user) or document.uploaded_by_id == getattr(
-            user, "id", None
-        ):
-            return True
-
-        prefetched = getattr(document, "_prefetched_objects_cache", {}).get(
-            "access_policies"
-        )
-
-        if prefetched is None:
-            policies = list(
-                DocumentAccessPolicy.objects.filter(
-                    document=document,
-                    is_deleted=False,
-                ).filter(Q(user=user) | Q(role=getattr(user, "role", "")))
-            )
-        else:
-            policies = [
-                policy
-                for policy in prefetched
-                if not policy.is_deleted
-                and (
-                    policy.user_id == getattr(user, "id", None)
-                    or (policy.role and policy.role == getattr(user, "role", ""))
-                )
-            ]
-
-        # Explicit document policy controls download when one applies. Department-
-        # based access falls back to view access when there is no explicit policy.
-        if policies:
-            return any(policy.can_download for policy in policies)
-
-        return True
+        return cls.can_action(user, document, "download")
 
     @classmethod
     def get_highest_access_level(cls, user, document):
+        if not cls.has_document_access(user, document):
+            return None
         if cls.is_company_admin(user):
             return DocumentAccessPolicy.AccessLevel.ADMIN
 
@@ -243,7 +397,9 @@ class DocumentPermissionService:
                 return DocumentAccessPolicy.AccessLevel.ADMIN
             return None
 
-        if document.uploaded_by_id == user.id:
+        if document.owner_user_id == user.id or (
+            document.owner_user_id is None and document.uploaded_by_id == user.id
+        ):
             return DocumentAccessPolicy.AccessLevel.ADMIN
 
         highest_rank = 0
@@ -268,7 +424,7 @@ class DocumentPermissionService:
         policies = DocumentAccessPolicy.objects.filter(
             document=document,
             is_deleted=False,
-        ).filter(Q(user=user) | Q(role=user.role))
+        ).filter(Q(user=user) | Q(user__isnull=True, role=user.role))
 
         for policy in policies:
             rank = cls.ACCESS_ORDER.get(policy.access_level, 0)

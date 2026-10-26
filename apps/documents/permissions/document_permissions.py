@@ -26,17 +26,41 @@ class IsCompanyDocumentUser(BasePermission):
         return bool(
             request.user
             and request.user.is_authenticated
+            and request.user.is_active
             and getattr(request.user, "company_id", None)
+            and not request.user.company.is_deleted
+            and request.user.company.status == "active"
         )
 
     def has_object_permission(self, request, view, obj):
+        actions = {
+            "preview": "download",
+            "download": "download",
+            "destroy": "delete",
+            "update": "edit",
+            "partial_update": "edit",
+            "access_policies": "administer",
+            "field_policies": "administer",
+            "remove_field_policy": "administer",
+            "remove_access_policy": "administer",
+            "retry_processing": "edit",
+            "governance": "administer"
+            if request.method != "GET"
+            else "governance_read",
+        }
+        if view.action in actions:
+            return DocumentPermissionService.can_action(
+                request.user, obj, actions[view.action]
+            )
         required_access = self.ACTION_ACCESS_MAP.get(
             getattr(view, "action", None),
             DocumentAccessPolicy.AccessLevel.VIEW,
         )
 
-        return DocumentPermissionService.has_document_access(
-            user=request.user,
-            document=obj,
-            required_access=required_access,
+        return (
+            DocumentPermissionService.can_action(request.user, obj, "view")
+            if required_access == "view"
+            else DocumentPermissionService.has_document_access(
+                request.user, obj, required_access=required_access
+            )
         )

@@ -5,6 +5,33 @@ from apps.ai_engine.models import LLMProviderConfig
 
 class LLMProviderConfigService:
     @classmethod
+    def get_private_config_for_company(cls, company):
+        config = (
+            LLMProviderConfig.objects.filter(
+                company=company,
+                is_active=True,
+                is_deleted=False,
+                provider_type=LLMProviderConfig.ProviderType.OLLAMA,
+            )
+            .order_by("-is_default", "-updated_at")
+            .first()
+        )
+        if config:
+            return config
+        # Reuse the server-controlled private Ollama defaults, regardless of the
+        # requested cloud default. Workflow configuration cannot supply endpoints.
+        return LLMProviderConfig(
+            company=company,
+            name="Environment Private Ollama",
+            provider_type=LLMProviderConfig.ProviderType.OLLAMA,
+            endpoint_url=os.getenv("OLLAMA_BASE_URL", "http://ollama:11434"),
+            model_name=os.getenv("OLLAMA_DEFAULT_MODEL", "qwen3:8b"),
+            max_tokens=int(os.getenv("OLLAMA_DEFAULT_MAX_TOKENS", "600")),
+            temperature=float(os.getenv("OLLAMA_TEMPERATURE", "0.2")),
+            is_active=True,
+        )
+
+    @classmethod
     def get_default_config_for_company(cls, company):
         config = (
             LLMProviderConfig.objects.filter(

@@ -7,11 +7,24 @@ from apps.audit.services import AuditLogService
 from apps.documents.models import DocumentAccessPolicy
 from apps.documents.services import DocumentPermissionService
 from apps.notifications.services import NotificationService
+from apps.documents.services.field_permission_service import FieldPermissionService
+from rest_framework.exceptions import PermissionDenied, ValidationError
 
 
 class ApprovalWorkflowService:
     @classmethod
     def user_can_view(cls, user, approval_request):
+        step = getattr(approval_request, "workflow_step_run", None)
+        if step is not None:
+            from apps.workflows.permissions.workflow_permissions import (
+                WorkflowPermissionService,
+            )
+
+            return WorkflowPermissionService.content_allowed(user, step.run)
+        if not DocumentPermissionService.can_action(
+            user, approval_request.document, "view"
+        ):
+            return False
         if DocumentPermissionService.is_company_admin(user):
             return True
 
@@ -32,6 +45,23 @@ class ApprovalWorkflowService:
 
     @classmethod
     def user_can_review(cls, user, approval_request):
+        step = getattr(approval_request, "workflow_step_run", None)
+        if step is not None:
+            from apps.workflows.permissions.workflow_permissions import (
+                WorkflowPermissionService,
+            )
+
+            return (
+                not approval_request.is_closed
+                and step.run.status == "approval_required"
+                and WorkflowPermissionService.can(user, step.run, "approve", step)
+            )
+        if not DocumentPermissionService.can_action(
+            user, approval_request.document, "correct"
+        ) or FieldPermissionService.has_restrictions(
+            user, approval_request.document, "view"
+        ):
+            return False
         if approval_request.is_closed:
             return False
 
@@ -59,6 +89,18 @@ class ApprovalWorkflowService:
 
     @classmethod
     def user_can_manage(cls, user, approval_request):
+        if getattr(approval_request, "workflow_step_run", None) is not None:
+            from apps.workflows.permissions.workflow_permissions import (
+                WorkflowPermissionService,
+            )
+
+            return WorkflowPermissionService.content_allowed(
+                user, approval_request.workflow_step_run.run
+            ) and DocumentPermissionService.is_company_admin(user)
+        if not DocumentPermissionService.can_action(
+            user, approval_request.document, "view"
+        ):
+            return False
         if DocumentPermissionService.is_company_admin(user):
             return True
 
@@ -90,6 +132,13 @@ class ApprovalWorkflowService:
         ip_address=None,
         user_agent="",
     ):
+        DocumentPermissionService.require_action(user, document, "correct")
+        if assigned_to and not DocumentPermissionService.can_action(
+            assigned_to, document, "correct"
+        ):
+            raise ValidationError(
+                "Assigned reviewer must have current review permission."
+            )
         approval = ApprovalRequest.objects.create(
             company=user.company,
             document=document,
@@ -145,6 +194,7 @@ class ApprovalWorkflowService:
         ip_address=None,
         user_agent="",
     ):
+        approval_request = cls._locked_review(user, approval_request)
         approval_request.status = ApprovalRequest.Status.APPROVED
         approval_request.reviewed_by = user
         approval_request.reviewed_at = timezone.now()
@@ -207,6 +257,7 @@ class ApprovalWorkflowService:
         ip_address=None,
         user_agent="",
     ):
+        approval_request = cls._locked_review(user, approval_request)
         approval_request.status = ApprovalRequest.Status.REJECTED
         approval_request.reviewed_by = user
         approval_request.reviewed_at = timezone.now()
@@ -266,6 +317,7 @@ class ApprovalWorkflowService:
         ip_address=None,
         user_agent="",
     ):
+        approval_request = cls._locked_review(user, approval_request)
         approval_request.status = ApprovalRequest.Status.CHANGES_REQUESTED
         approval_request.reviewed_by = user
         approval_request.reviewed_at = timezone.now()
@@ -331,6 +383,14 @@ class ApprovalWorkflowService:
         ip_address=None,
         user_agent="",
     ):
+        if not cls.user_can_view(
+            user, approval_request
+        ) or FieldPermissionService.has_restrictions(
+            user, approval_request.document, "view"
+        ):
+            raise PermissionDenied(
+                "Current document and field permissions are required."
+            )
         approval_comment = ApprovalComment.objects.create(
             company=approval_request.company,
             approval_request=approval_request,
@@ -370,6 +430,11 @@ class ApprovalWorkflowService:
 
     @classmethod
     def sync_extraction_run_status(cls, approval_request):
+        from apps.workflows.services.workflow_engine_service import (
+            WorkflowEngineService,
+        )
+
+        WorkflowEngineService.approval_decided(approval_request)
         if approval_request.review_type != ApprovalRequest.ReviewType.EXTRACTION_REVIEW:
             return
 
@@ -394,6 +459,27 @@ class ApprovalWorkflowService:
             return
 
         extraction_run.save(update_fields=["status", "updated_at"])
+
+    @staticmethod
+    def _locked_review(user, approval_request):
+        from apps.workflows.models import WorkflowStepRun
+        from apps.workflows.services.workflow_engine_service import (
+            WorkflowEngineService,
+        )
+
+        linked = WorkflowStepRun.objects.filter(approval=approval_request).first()
+        if linked:
+            WorkflowEngineService.locked(linked.run)
+        current = (
+            ApprovalRequest.objects.select_for_update()
+            .select_related("document")
+            .get(pk=approval_request.pk, company=user.company, is_deleted=False)
+        )
+        if current.is_closed or current.status == ApprovalRequest.Status.DRAFT:
+            raise ValidationError("Approval is not open for review.")
+        if not ApprovalWorkflowService.user_can_review(user, current):
+            raise PermissionDenied("Current document review permission is required.")
+        return current
 
     @staticmethod
     def add_system_comment(approval_request, message):

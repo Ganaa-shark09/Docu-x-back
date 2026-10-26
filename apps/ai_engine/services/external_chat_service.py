@@ -1426,6 +1426,7 @@ class ExternalChatService:
                     "chunk_uuid": chunk.get("chunk_uuid"),
                     "document_uuid": chunk.get("document_uuid"),
                     "document_title": chunk.get("document_title"),
+                    "governance_revision": chunk.get("governance_revision"),
                     "chunk_index": chunk.get("chunk_index"),
                     "score": chunk.get("score"),
                     "content_preview": (

@@ -9,6 +9,7 @@ from apps.approvals.models import ApprovalRequest
 from apps.audit.models import AuditLog
 from apps.audit.services import AuditLogService
 from apps.workflows.models import ExtractionRun
+from apps.documents.services import DocumentPermissionService
 
 
 class ExtractionExportService:
@@ -23,6 +24,16 @@ class ExtractionExportService:
         ip_address=None,
         user_agent="",
     ):
+        from apps.workflows.models import ContractReview
+        from rest_framework.exceptions import ValidationError
+
+        if ContractReview.objects.filter(extraction_run=extraction_run).exists():
+            raise ValidationError(
+                "Use the permission-checked finalized contract export."
+            )
+        DocumentPermissionService.require_action(
+            user, extraction_run.document, "export"
+        )
         export_format = (export_format or "json").lower()
 
         if export_format not in cls.SUPPORTED_FORMATS:
@@ -193,6 +204,12 @@ class ExtractionExportService:
         )
         return safe.strip("_")[:80] or "extraction"
 
+    @staticmethod
+    def safe_cell(value):
+        if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")):
+            return "'" + value
+        return value
+
     @classmethod
     def export_json(cls, payload):
         filename = cls.safe_filename(payload["document"]["title"])
@@ -231,16 +248,19 @@ class ExtractionExportService:
         for field in payload["fields"]:
             writer.writerow(
                 [
-                    field["field_key"],
-                    field["label"],
-                    field["value"],
-                    field["extracted_value"],
-                    field["corrected_value"],
-                    field["confidence_score"],
-                    field["is_corrected"],
-                    field["is_required"],
-                    field["is_missing"],
-                    field["source_text"],
+                    cls.safe_cell(item)
+                    for item in [
+                        field["field_key"],
+                        field["label"],
+                        field["value"],
+                        field["extracted_value"],
+                        field["corrected_value"],
+                        field["confidence_score"],
+                        field["is_corrected"],
+                        field["is_required"],
+                        field["is_missing"],
+                        field["source_text"],
+                    ]
                 ]
             )
 
@@ -297,14 +317,14 @@ class ExtractionExportService:
                 [
                     field["field_key"],
                     field["label"],
-                    field["value"],
-                    field["extracted_value"],
-                    field["corrected_value"],
+                    cls.safe_cell(field["value"]),
+                    cls.safe_cell(field["extracted_value"]),
+                    cls.safe_cell(field["corrected_value"]),
                     field["confidence_score"],
                     field["is_corrected"],
                     field["is_required"],
                     field["is_missing"],
-                    field["source_text"],
+                    cls.safe_cell(field["source_text"]),
                 ]
             )
 
@@ -313,6 +333,7 @@ class ExtractionExportService:
             column_letter = column_cells[0].column_letter
 
             for cell in column_cells:
+                cell.value = cls.safe_cell(cell.value)
                 value = str(cell.value or "")
                 max_length = max(max_length, len(value))
 

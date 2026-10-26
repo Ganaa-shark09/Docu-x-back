@@ -4,6 +4,30 @@ from apps.ai_engine.models import AIConversation, AIMessage
 
 
 class AIMessageSerializer(serializers.ModelSerializer):
+    def to_representation(self, instance):
+        from apps.ai_engine.services.message_visibility_service import (
+            MessageVisibilityService,
+        )
+
+        request = self.context.get("request")
+        if request:
+            key = (request.user.pk, instance.conversation.scope)
+            cache = self.context.setdefault("message_visibility", {})
+            if key not in cache:
+                cache[key] = MessageVisibilityService.allowed_documents(
+                    request.user, instance.conversation.scope
+                )
+            if not MessageVisibilityService.visible(instance, request.user, cache[key]):
+                return {
+                    "uuid": str(instance.uuid),
+                    "role": instance.role,
+                    "content": MessageVisibilityService.OMITTED,
+                    "retrieved_sources": [],
+                    "metadata": {"protected_context_omitted": True},
+                    "created_at": instance.created_at,
+                }
+        return super().to_representation(instance)
+
     class Meta:
         model = AIMessage
         fields = [
@@ -61,6 +85,9 @@ class AIConversationDetailSerializer(serializers.ModelSerializer):
 
 
 class AIChatRequestSerializer(serializers.Serializer):
+    domain = serializers.ChoiceField(choices=["hr_policy"], required=False)
+    policy_context = serializers.JSONField(required=False)
+    idempotency_key = serializers.CharField(max_length=128, required=False)
     DOCUMENT_SCOPE_ALL = "all"
     DOCUMENT_SCOPE_SELECTED = "selected"
 

@@ -1,4 +1,5 @@
 from django.db.models import Q
+from django.db import transaction
 from django.http import FileResponse, Http404
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
@@ -7,6 +8,7 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 
 from apps.documents.models import Document, DocumentProcessingJob
+from apps.documents.services.invoice_readiness_service import InvoiceReadinessService
 from apps.documents.permissions import IsCompanyDocumentUser
 from apps.documents.serializers import (
     DocumentAccessPolicySerializer,
@@ -21,6 +23,15 @@ from apps.documents.services import (
     DocumentPermissionService,
     DocumentProcessingJobService,
     DocumentProcessingQueueService,
+)
+from apps.audit.models import AuditLog
+from apps.audit.services import AuditLogService
+from apps.documents.serializers.governance_serializers import (
+    DocumentGovernanceSerializer,
+    DocumentFieldPolicySerializer,
+)
+from apps.documents.services.document_governance_service import (
+    DocumentGovernanceService,
 )
 
 
@@ -152,7 +163,119 @@ class DocumentViewSet(viewsets.ModelViewSet):
         )
 
     def perform_destroy(self, instance):
-        instance.soft_delete()
+        DocumentGovernanceService.delete(
+            self.request.user, instance, request=self.request
+        )
+
+    @action(detail=True, methods=["get"], url_path="invoice-readiness")
+    def invoice_readiness(self, request, uuid=None):
+        document = self.get_object()
+        # Never expose source-derived field hints via a metadata-only grant.
+        DocumentPermissionService.require_action(request.user, document, "edit")
+        result = InvoiceReadinessService.assess(document, user=request.user)
+        response = Response(result)
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @action(detail=True, methods=["get", "patch"])
+    def governance(self, request, uuid=None):
+        document = self.get_object()
+        serializer = DocumentGovernanceSerializer(
+            document, context=self.get_serializer_context()
+        )
+        if request.method == "PATCH":
+            serializer = DocumentGovernanceSerializer(
+                document, data=request.data, context=self.get_serializer_context()
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+        return Response(serializer.data)
+
+    @action(detail=True, methods=["get", "post"], url_path="field-policies")
+    @transaction.atomic
+    def field_policies(self, request, uuid=None):
+        document = self.get_object()
+        if request.method == "GET":
+            return Response(
+                DocumentFieldPolicySerializer(
+                    document.field_policies.filter(is_deleted=False),
+                    many=True,
+                    context=self.get_serializer_context(),
+                ).data
+            )
+        document = Document.objects.select_for_update().get(
+            pk=document.pk, company=request.user.company, is_deleted=False
+        )
+        DocumentPermissionService.require_action(request.user, document, "administer")
+        serializer = DocumentFieldPolicySerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        rule = serializer.save(document=document)
+        self._log_permission(document, "field_rule_created", rule.uuid)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(
+        detail=True,
+        methods=["delete"],
+        url_path=r"field-policies/(?P<policy_uuid>[0-9a-f-]{36})",
+    )
+    @transaction.atomic
+    def remove_field_policy(self, request, uuid=None, policy_uuid=None):
+        document = self.get_object()
+        document = Document.objects.select_for_update().get(
+            pk=document.pk, company=request.user.company, is_deleted=False
+        )
+        DocumentPermissionService.require_action(request.user, document, "administer")
+        rule = document.field_policies.filter(
+            uuid=policy_uuid, is_deleted=False
+        ).first()
+        if rule is None:
+            raise Http404()
+        # Soft-deleted rules must continue protecting historic answers via the
+        # governance revision captured in their provenance.
+        rule.soft_delete()
+        self._log_permission(document, "field_rule_revoked", rule.uuid)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(
+        detail=True,
+        methods=["delete"],
+        url_path=r"access-policies/(?P<policy_uuid>[0-9a-f-]{36})",
+    )
+    @transaction.atomic
+    def remove_access_policy(self, request, uuid=None, policy_uuid=None):
+        document = self.get_object()
+        document = Document.objects.select_for_update().get(
+            pk=document.pk, company=request.user.company, is_deleted=False
+        )
+        DocumentPermissionService.require_action(request.user, document, "administer")
+        rule = document.access_policies.filter(
+            uuid=policy_uuid, is_deleted=False
+        ).first()
+        if rule is None:
+            raise Http404()
+        rule.soft_delete()
+        self._log_permission(document, "document_grant_revoked", rule.uuid)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    def _log_permission(self, document, operation, rule_uuid):
+        document.governance_revision += 1
+        document.save(update_fields=["governance_revision", "updated_at"])
+        AuditLogService.log(
+            company=self.request.user.company,
+            user=self.request.user,
+            event_type=AuditLog.EventType.DOCUMENT_PERMISSION_CHANGED,
+            action="Document permission changed.",
+            resource_type="document",
+            resource_uuid=document.uuid,
+            ip_address=self.request.META.get("REMOTE_ADDR"),
+            metadata={
+                "operation": operation,
+                "rule_uuid": str(rule_uuid),
+                "revision": document.governance_revision,
+            },
+        )
 
     @action(detail=False, methods=["get"], url_path="ai-library")
     def ai_library(self, request):
@@ -280,8 +403,16 @@ class DocumentViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=True, methods=["get", "post"], url_path="access-policies")
+    @transaction.atomic
     def access_policies(self, request, uuid=None):
         document = self.get_object()
+        if request.method == "POST":
+            document = Document.objects.select_for_update().get(
+                pk=document.pk, company=request.user.company, is_deleted=False
+            )
+            DocumentPermissionService.require_action(
+                request.user, document, "administer"
+            )
 
         if not DocumentPermissionService.has_document_access(
             user=request.user,
@@ -306,6 +437,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
             context=self.get_serializer_context(),
         )
         serializer.is_valid(raise_exception=True)
-        serializer.save(document=document)
+        rule = serializer.save(document=document)
+        self._log_permission(document, "document_grant_created", rule.uuid)
 
         return Response(serializer.data, status=status.HTTP_201_CREATED)

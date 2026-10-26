@@ -286,3 +286,18 @@ DOCUMENT_UPLOAD_MAX_PDF_PAGES = env.int(
     "DOCUMENT_UPLOAD_MAX_PDF_PAGES",
     default=1000,
 )
+
+CELERY_BEAT_SCHEDULE = {
+    "recover-pending-invoice-handoffs": {
+        "task": "apps.integrations.tasks.invoice_accounting_tasks.dispatch_pending_invoice_handoffs",
+        "schedule": 60.0,
+    },
+    "recover-waiting-invoice-batches": {
+        "task": "apps.workflows.tasks.invoice_batch_tasks.dispatch_waiting_invoice_batches",
+        "schedule": 60.0,
+    },
+    "recover-queued-workflows": {
+        "task": "apps.workflows.tasks.workflow_tasks.dispatch_queued_workflows",
+        "schedule": 60.0,
+    },
+}
