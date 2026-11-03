@@ -183,6 +183,8 @@ class ContractSchemaTests(SimpleTestCase):
 class ContractWorkflowTests(APITestCase):
     @classmethod
     def setUpTestData(cls):
+        from apps.workflows.tests.system_reference_data import ensure_contract_schema
+        ensure_contract_schema()
         cls.company = Company.objects.create(
             name="Contract Company", slug="contract-company"
         )

@@ -204,6 +204,10 @@ def test_malformed_model_output(answer):
 class ClauseIntelligenceTests(APITestCase):
     @classmethod
     def setUpTestData(cls):
+        from apps.workflows.tests.system_reference_data import ensure_clause_taxonomy
+        ensure_clause_taxonomy()
+        from apps.workflows.tests.system_reference_data import ensure_contract_schema
+        ensure_contract_schema()
         cls.company = Company.objects.create(name="Legal", slug="legal")
         cls.other = Company.objects.create(name="Foreign Legal", slug="foreign-legal")
         cls.admin = User.objects.create_user(

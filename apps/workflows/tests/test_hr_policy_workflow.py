@@ -87,6 +87,14 @@ class PolicyEvidenceTests(SimpleTestCase):
             quote,
         )
 
+    def test_unhashable_model_citation_ids_are_rejected_cleanly(self):
+        for value in ([], {"uuid": "bad"}):
+            with self.subTest(value=value), self.assertRaises(ValidationError):
+                HRPolicyQAService.citations(
+                    json.dumps({"citations": [{"chunk_uuid": value, "quote": "sample quotation text"}]}),
+                    [{"chunk_uuid": "valid", "content": TEXT}],
+                )
+
     def test_invalid_json_abstention_boundary(self):
         for value in [
             "not JSON",
@@ -136,8 +144,14 @@ class HRPolicyWorkflowTests(APITestCase):
                 user=user,
                 role="reviewer" if user == cls.reviewer else "member",
             )
-        cls.category = HRPolicyCategory.objects.get(
-            company=None, kind="policy", code="leave"
+        # Each test class owns its reference data. TransactionTestCase tests in
+        # this module flush the database, so migration-seeded global categories
+        # cannot be assumed to survive --reuse-db or selected-test ordering.
+        cls.category, _ = HRPolicyCategory.objects.get_or_create(
+            company=None,
+            kind="policy",
+            code="leave",
+            defaults={"name": "Leave policies", "is_active": True},
         )
 
     def setUp(self):
@@ -467,6 +481,110 @@ class HRPolicyWorkflowTests(APITestCase):
         ):
             return HRPolicyQAService.chat(self.admin, question, idempotency_key=key)
 
+    def test_hr_qa_uses_only_the_granted_model_id(self):
+        from apps.ai_engine.models import CompanyModelGrant, LLMProviderConfig
+
+        self.published()
+        Company.objects.filter(pk=self.company.pk).update(allow_local_llm=True)
+        self.company.refresh_from_db()
+        provider = LLMProviderConfig.objects.create(
+            company=self.company,
+            name="HR approved Ollama",
+            provider_type="ollama",
+            model_name="provider-default-not-granted",
+            endpoint_url="http://ollama:11434",
+            is_default=True,
+        )
+        CompanyModelGrant.objects.create(
+            company=self.company,
+            provider_config=provider,
+            model_id="qwen3:8b",
+            display_name="Approved HR model",
+            is_default=True,
+        )
+        chunk = DocumentChunk.objects.get(document=self.doc)
+        output = {
+            "answer": json.dumps({"citations": [{
+                "chunk_uuid": str(chunk.uuid),
+                "quote": "Annual leave allowance is 20 days per calendar year.",
+            }]}),
+            "provider": "ollama", "model": "qwen3:8b",
+        }
+        with patch(
+            "apps.workflows.services.hr_policy_qa_service.LLMGatewayService.generate_answer",
+            return_value=output,
+        ) as model:
+            result = HRPolicyQAService.chat(
+                self.admin, "What is our annual leave allowance?", idempotency_key="hr-granted-model"
+            )
+        routed = model.call_args.kwargs["provider_config"]
+        self.assertEqual(routed.pk, provider.pk)
+        self.assertEqual(routed.model_name, "qwen3:8b")
+        self.assertTrue(routed._entitlement_enforced)
+        self.assertEqual(result["policy"]["status"], "answered")
+
+    def test_shared_document_policy_evidence_requires_review(self):
+        self.published()
+        another_category = HRPolicyCategory.objects.create(
+            company=self.company, kind="policy", code="conduct", name="Conduct"
+        )
+        other_policy = HRPolicyService.create(
+            self.admin,
+            title="Conduct policy",
+            code="conduct-" + uuid.uuid4().hex[:10],
+            category_uuid=another_category.uuid,
+            department=self.department.pk,
+            draft={"document_uuid": str(self.doc.uuid), "effective_from": "2026-01-01"},
+        )
+        self.published(other_policy)
+        with patch(
+            "apps.workflows.services.hr_policy_qa_service.LLMGatewayService.generate_answer"
+        ) as model:
+            result = HRPolicyQAService.chat(
+                self.admin, "What does the policy say?", idempotency_key="hr-shared-document"
+            )
+        model.assert_not_called()
+        self.assertEqual(result["policy"]["status"], "review_required")
+        self.assertEqual(result["policy"]["reason"], "ambiguous_shared_policy_source")
+        self.assertEqual(result["sources"], [])
+
+    def test_sensitive_question_does_not_use_ungranted_private_provider(self):
+        from apps.ai_engine.models import CompanyModelGrant, LLMProviderConfig
+        from apps.documents.models import DocumentAccessPolicy
+
+        Document.objects.filter(pk=self.doc.pk).update(sensitivity_label="highly_confidential")
+        self.doc.refresh_from_db()
+        DocumentAccessPolicy.objects.create(
+            document=self.doc, user=self.admin, access_level="admin", can_use_ai=True
+        )
+        self.published()
+        cloud = LLMProviderConfig(
+            company=self.company, name="Approved cloud", provider_type="openai",
+            model_name="gpt-4.1-mini", endpoint_url="https://api.openai.com/v1",
+            is_default=True,
+        )
+        cloud.set_api_key("test-secret-not-for-production")
+        cloud.save()
+        CompanyModelGrant.objects.create(
+            company=self.company, provider_config=cloud, model_id="gpt-4.1-mini",
+            display_name="Approved cloud", is_default=True,
+        )
+        LLMProviderConfig.objects.create(
+            company=self.company, name="Unapproved private", provider_type="ollama",
+            model_name="unsafe-ungoverned", endpoint_url="http://ollama:11434",
+        )
+        with patch(
+            "apps.workflows.services.hr_policy_qa_service.LLMGatewayService.generate_answer"
+        ) as model:
+            result = HRPolicyQAService.chat(
+                self.admin, "What is our annual leave allowance?", idempotency_key="hr-no-private-grant"
+            )
+        model.assert_not_called()
+        self.assertEqual(result["policy"]["status"], "abstained")
+        self.assertEqual(result["policy"]["reason"], "approved_private_model_unavailable")
+        self.assertTrue(result["firewall"]["forced_local"])
+        self.assertFalse(result["sources"])
+
     def test_source_grounded_answer_contains_version_proof(self):
         version = self.published()
         result = self.qa()
@@ -541,6 +659,10 @@ class HRPolicyWorkflowTests(APITestCase):
         )
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["policy"]["status"], "abstained")
+        from apps.ai_engine.models import AIMessage
+
+        saved = AIMessage.objects.get(uuid=response.data["message_uuid"])
+        self.assertEqual(saved.metadata["document_dependencies"], {})
 
     def test_invalid_effective_date_is_rejected(self):
         for value in ["yesterday", "2026-99-01", 42]:

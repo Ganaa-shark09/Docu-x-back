@@ -1,11 +1,13 @@
 import json
 import re
+from copy import copy
 
 from django.db import transaction
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from apps.accounts.models import User
 from apps.ai_engine.models import AIMessage
+from apps.ai_engine.services.company_model_access_service import CompanyModelAccessService
 from apps.ai_engine.services.internal_conversation_memory_service import (
     InternalConversationMemoryService,
 )
@@ -98,6 +100,7 @@ class HRPolicyQAService:
             if (
                 not isinstance(item, dict)
                 or set(item) != {"chunk_uuid", "quote"}
+                or not isinstance(item["chunk_uuid"], str)
                 or item["chunk_uuid"] not in available
             ):
                 raise ValidationError("Policy answer cited an unavailable source.")
@@ -199,6 +202,17 @@ class HRPolicyQAService:
                 context = cls.validate_context(prior.metadata.get("policy_context", {}))
         resolution = HRPolicyResolver.resolve(user, **context)
         versions = resolution.pop("versions")
+        # A single indexed document may back several distinct published policies.
+        # Search results carry document and chunk IDs, not policy-version IDs, so
+        # there is no defensible way to attribute a quote to one of those versions.
+        # Fail closed rather than silently choosing an arbitrary policy version.
+        source_documents = [version.document_id for version in versions]
+        if len(source_documents) != len(set(source_documents)):
+            resolution.update(
+                status="review_required",
+                reason="ambiguous_shared_policy_source",
+            )
+            versions = []
         if (
             not context.get("as_of")
             and not context.get("version_uuids")
@@ -311,28 +325,54 @@ class HRPolicyQAService:
                 )
                 valid.append(chunk)
             chunks = valid
-            provider = LLMProviderConfigService.get_default_config_for_company(
-                user.company
+            # Both /api/workflows/hr-policies/ask/ and /api/ai/chat/ (HR domain)
+            # reach here. Enforce company grants in this shared service instead
+            # of relying on a check in just one API entry point.
+            approved_provider, approved_grant = CompanyModelAccessService.resolve(
+                user
+            )
+            provider = (
+                approved_provider
+                or LLMProviderConfigService.get_default_config_for_company(user.company)
             )
             enforced = AIContextPolicyEnforcementService.enforce(
                 user=user, provider_config=provider, retrieved_chunks=chunks
             )
+            private_unavailable = False
             if enforced["forced_local"]:
-                private = LLMProviderConfigService.get_private_config_for_company(
-                    user.company
-                )
-                enforced = AIContextPolicyEnforcementService.enforce(
-                    user=user, provider_config=private, retrieved_chunks=chunks
-                )
-                if enforced["effective_provider_type"] not in {"local", "ollama"}:
-                    raise PermissionDenied(
-                        "Private policy model routing is unavailable."
+                if approved_grant:
+                    # A sensitivity-based local reroute must also be entitled.
+                    # Never fall back to an ungranted environment or DB model.
+                    private_grant = CompanyModelAccessService.available(
+                        user.company
+                    ).filter(provider_config__provider_type__in=["ollama", "local"]).first()
+                    if private_grant:
+                        private = copy(private_grant.provider_config)
+                        private.model_name = private_grant.model_id
+                        private._entitlement_enforced = True
+                    else:
+                        private = None
+                        private_unavailable = True
+                        resolution["reason"] = "approved_private_model_unavailable"
+                else:
+                    # Legacy tenants without explicit grants retain their previous
+                    # private-routing behavior until strict grants are enabled.
+                    private = LLMProviderConfigService.get_private_config_for_company(
+                        user.company
                     )
-                enforced["forced_local"] = True
-                enforced["requested_provider_type"] = (
-                    provider.provider_type if provider else "local"
-                )
-            safe = enforced["chunks"]
+                if not private_unavailable:
+                    enforced = AIContextPolicyEnforcementService.enforce(
+                        user=user, provider_config=private, retrieved_chunks=chunks
+                    )
+                    if enforced["effective_provider_type"] not in {"local", "ollama"}:
+                        raise PermissionDenied(
+                            "Private policy model routing is unavailable."
+                        )
+                    enforced["forced_local"] = True
+                    enforced["requested_provider_type"] = (
+                        provider.provider_type if provider else "local"
+                    )
+            safe = [] if private_unavailable else enforced["chunks"]
             if safe and not enforced["blocked_count"]:
                 instruction = (
                     "Explain company HR policy only by selecting relevant verbatim source quotations. "
@@ -367,7 +407,7 @@ class HRPolicyQAService:
                 except ValidationError:
                     resolution["reason"] = "invalid_or_unsupported_model_evidence"
             else:
-                resolution["reason"] = (
+                resolution["reason"] = resolution.get("reason") or (
                     "firewall_blocked"
                     if enforced["blocked_count"]
                     else "insufficient_source_evidence"
@@ -471,6 +511,12 @@ class HRPolicyQAService:
                 "hr_policy": policy_metadata,
                 "policy_context": context,
                 "hr_policy_versions": policy_metadata["policy_versions"],
+                # Empty lineage is explicit for a source-free abstention. Sourced
+                # answers pin governance revisions and are reauthorized on read.
+                "document_dependencies": {
+                    str(source["document_uuid"]): source.get("governance_revision")
+                    for source in sources
+                },
                 "user_message_uuid": str(user_message.uuid),
                 "document_scope": {
                     "mode": "hr_policy",

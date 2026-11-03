@@ -412,6 +412,8 @@ class InvoiceWorkflowTests(APITestCase):
 
     @classmethod
     def setUpTestData(cls):
+        from apps.workflows.tests.system_reference_data import ensure_invoice_schema
+        ensure_invoice_schema()
         cls.company = Company.objects.create(name="Invoices", slug="invoices")
         cls.other = Company.objects.create(name="Other invoices", slug="other-invoices")
         cls.admin = User.objects.create_user(

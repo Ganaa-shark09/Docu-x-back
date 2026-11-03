@@ -26,6 +26,8 @@ class InvoiceFindingLifecycleTests(TestCase):
 
     @classmethod
     def setUpTestData(cls):
+        from apps.workflows.tests.system_reference_data import ensure_invoice_schema
+        ensure_invoice_schema()
         cls.company = Company.objects.create(
             name="Invoice finding lifecycle", slug="invoice-finding-lifecycle"
         )
