@@ -42,6 +42,7 @@ class AIChatAPIView(APIView):
             result = RAGChatService.chat(
                 user=request.user,
                 message=serializer.validated_data["message"],
+                model_uuid=serializer.validated_data.get("model_uuid"),
                 conversation_uuid=serializer.validated_data.get("conversation_uuid"),
                 department_uuid=serializer.validated_data.get("department"),
                 document_type=serializer.validated_data.get("document_type"),

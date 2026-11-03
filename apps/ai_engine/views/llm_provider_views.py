@@ -1,4 +1,5 @@
 from rest_framework import viewsets
+from rest_framework.exceptions import PermissionDenied
 
 from apps.ai_engine.models import LLMProviderConfig
 from apps.ai_engine.permissions import IsLLMProviderAdmin
@@ -31,5 +32,19 @@ class LLMProviderConfigViewSet(viewsets.ModelViewSet):
             "name",
         )
 
+    def _require_platform_superuser(self):
+        # Endpoint URLs, keys, and provider types must not be tenant-editable.
+        if not self.request.user.is_superuser:
+            raise PermissionDenied("Only a platform superuser may change provider credentials or routing.")
+
+    def perform_create(self, serializer):
+        self._require_platform_superuser()
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._require_platform_superuser()
+        serializer.save()
+
     def perform_destroy(self, instance):
+        self._require_platform_superuser()
         instance.soft_delete()

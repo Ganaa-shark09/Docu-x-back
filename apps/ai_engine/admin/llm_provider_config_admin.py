@@ -60,3 +60,20 @@ class LLMProviderConfigAdmin(admin.ModelAdmin):
     list_filter = ("provider_type", "is_default", "is_active")
     search_fields = ("name", "company__name", "model_name", "deployment_name")
     readonly_fields = ("uuid", "created_at", "updated_at")
+
+
+    # Provider credentials, endpoint and routing are platform-controlled.
+    def has_module_permission(self, request):
+        return bool(request.user.is_active and request.user.is_superuser)
+
+    def has_view_permission(self, request, obj=None):
+        return self.has_module_permission(request)
+
+    def has_add_permission(self, request):
+        return self.has_module_permission(request)
+
+    def has_change_permission(self, request, obj=None):
+        return self.has_module_permission(request)
+
+    def has_delete_permission(self, request, obj=None):
+        return self.has_module_permission(request)

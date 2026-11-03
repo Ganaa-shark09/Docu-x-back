@@ -6,6 +6,9 @@ import time
 import requests
 
 from apps.ai_engine.models import LLMProviderConfig
+from apps.ai_engine.services.llm_cloud_providers import (
+    ModelProviderUnavailable, GroqLLMProvider, GeminiLLMProvider, AnthropicLLMProvider,
+)
 from apps.ai_engine.services.llm_provider_security_service import (
     LLMProviderSecurityService,
 )
@@ -368,6 +371,8 @@ class OpenAILLMProvider:
         api_key = config.get_api_key() if config else ""
 
         if not api_key:
+            if getattr(config, "_entitlement_enforced", False):
+                raise ModelProviderUnavailable("Selected OpenAI credentials are unavailable.")
             result = LocalFallbackLLMProvider.generate_answer(
                 question,
                 retrieved_chunks,
@@ -414,6 +419,9 @@ class OpenAILLMProvider:
             }
 
         except Exception as exc:
+            if getattr(config, "_entitlement_enforced", False):
+                logger.warning("selected_openai_request_failed")
+                raise ModelProviderUnavailable() from exc
             result = LocalFallbackLLMProvider.generate_answer(
                 question,
                 retrieved_chunks,
@@ -585,6 +593,10 @@ class LLMGatewayService:
                 allow_extractive_fallback=allow_extractive_fallback,
             )
 
+        # An entitlement-selected Ollama model may not be overridden by caller options.
+        if getattr(provider_config, "_entitlement_enforced", False):
+            generation_options = {k: v for k, v in (generation_options or {}).items() if k != "model"}
+
         if provider_config.provider_type == LLMProviderConfig.ProviderType.OLLAMA:
             return OllamaLLMProvider.generate_answer(
                 question=question,
@@ -595,6 +607,13 @@ class LLMGatewayService:
                 generation_options=generation_options,
                 allow_extractive_fallback=allow_extractive_fallback,
             )
+
+        if provider_config.provider_type == LLMProviderConfig.ProviderType.GROQ:
+            return GroqLLMProvider.generate_answer(question, retrieved_chunks, prompt, provider_config)
+        if provider_config.provider_type == LLMProviderConfig.ProviderType.GEMINI:
+            return GeminiLLMProvider.generate_answer(question, retrieved_chunks, prompt, provider_config)
+        if provider_config.provider_type == LLMProviderConfig.ProviderType.ANTHROPIC:
+            return AnthropicLLMProvider.generate_answer(question, retrieved_chunks, prompt, provider_config)
 
         if provider_config.provider_type == LLMProviderConfig.ProviderType.OPENAI:
             return OpenAILLMProvider.generate_answer(

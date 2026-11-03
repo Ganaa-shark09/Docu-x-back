@@ -10,3 +10,5 @@ __all__ = [
 ]
 
 from .ai_conversation_document import AIConversationDocument
+
+from .company_model_grant import CompanyModelGrant

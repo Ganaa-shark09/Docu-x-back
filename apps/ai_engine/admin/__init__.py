@@ -8,3 +8,5 @@ __all__ = [
     "AIConversationDocumentAdmin",
 ]
 from .ai_conversation_document_admin import AIConversationDocumentAdmin
+
+from .company_model_grant_admin import CompanyModelGrantAdmin

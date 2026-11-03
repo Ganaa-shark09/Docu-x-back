@@ -12,6 +12,9 @@ class AIContextPolicyEnforcementService:
     CLOUD_PROVIDERS = {
         LLMProviderConfig.ProviderType.OPENAI,
         LLMProviderConfig.ProviderType.AZURE_OPENAI,
+        LLMProviderConfig.ProviderType.GROQ,
+        LLMProviderConfig.ProviderType.GEMINI,
+        LLMProviderConfig.ProviderType.ANTHROPIC,
     }
 
     LOCAL_PRIVATE_PROVIDERS = {

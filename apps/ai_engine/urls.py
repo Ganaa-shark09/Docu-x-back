@@ -13,7 +13,14 @@ from apps.ai_engine.views import (
     LLMProviderConfigViewSet,
 )
 
+from apps.ai_engine.views.company_model_views import CompanyModelGrantViewSet
+from apps.ai_engine.views.platform_model_administration import (
+    PlatformCompanyListAPIView, PlatformCompanyDetailAPIView,
+    PlatformProviderListAPIView, PlatformProviderDetailAPIView,
+)
+
 router = DefaultRouter()
+router.register("company-models", CompanyModelGrantViewSet, basename="company-models")
 router.register("llm-providers", LLMProviderConfigViewSet, basename="llm-providers")
 router.register(
     "external-documents",
@@ -22,6 +29,10 @@ router.register(
 )
 
 urlpatterns = [
+    path("platform/companies/", PlatformCompanyListAPIView.as_view(), name="platform-ai-companies"),
+    path("platform/companies/<uuid:uuid>/", PlatformCompanyDetailAPIView.as_view(), name="platform-ai-company"),
+    path("platform/providers/", PlatformProviderListAPIView.as_view(), name="platform-ai-providers"),
+    path("platform/providers/<uuid:uuid>/", PlatformProviderDetailAPIView.as_view(), name="platform-ai-provider"),
     path("chat/", AIChatAPIView.as_view(), name="ai-chat"),
     path("external-chat/", ExternalChatAPIView.as_view(), name="external-ai-chat"),
     path(

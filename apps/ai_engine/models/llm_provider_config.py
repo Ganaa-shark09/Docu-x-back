@@ -11,6 +11,9 @@ class LLMProviderConfig(BaseModel):
         OLLAMA = "ollama", "Ollama Local LLM"
         OPENAI = "openai", "OpenAI"
         AZURE_OPENAI = "azure_openai", "Azure OpenAI"
+        GROQ = "groq", "Groq"
+        GEMINI = "gemini", "Google Gemini"
+        ANTHROPIC = "anthropic", "Anthropic Claude"
 
     company = models.ForeignKey(
         Company,

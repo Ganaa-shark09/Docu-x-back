@@ -1,4 +1,6 @@
 from django.db import transaction
+from rest_framework.exceptions import ValidationError
+from apps.ai_engine.services.company_model_access_service import CompanyModelAccessService
 
 from apps.ai_engine.models import AIConversation, AIMessage
 from apps.ai_engine.services.internal_document_scope_service import (
@@ -47,9 +49,16 @@ class RAGChatService:
         domain=None,
         policy_context=None,
         idempotency_key=None,
+        model_uuid=None,
     ):
         if scope != Document.Scope.INTERNAL:
             raise ValueError("RAGChatService only supports Internal AI document scope.")
+        # Model entitlements are checked before the transaction writes messages.
+        # HR and summary pipelines have separate, policy-controlled model routing.
+        if model_uuid and (domain == "hr_policy" or InternalConversationMemoryService.is_summary_request(message)):
+            raise ValidationError({"model_uuid": "Model selection is not supported for this specialized answer workflow."})
+        selected_config, selected_grant = CompanyModelAccessService.resolve(user, model_uuid)
+
         if domain == "hr_policy":
             from apps.workflows.services.hr_policy_qa_service import HRPolicyQAService
 
@@ -146,7 +155,7 @@ class RAGChatService:
         )
 
         requested_provider_config = (
-            LLMProviderConfigService.get_default_config_for_company(user.company)
+            selected_config or LLMProviderConfigService.get_default_config_for_company(user.company)
         )
 
         enforcement_result = AIContextPolicyEnforcementService.enforce(
@@ -164,6 +173,8 @@ class RAGChatService:
                 user_message=user_message,
                 message=message,
                 document_scope_metadata=document_scope_metadata,
+                selected_config=selected_config,
+                selected_grant=selected_grant,
             )
 
         prompt = PromptBuilderService.build_rag_prompt(
@@ -214,6 +225,7 @@ class RAGChatService:
                 "department_uuid": str(department_uuid) if department_uuid else None,
                 "document_scope": document_scope_metadata,
                 "user_message_uuid": str(user_message.uuid),
+                "selected_model_uuid": str(selected_grant.uuid) if selected_grant else None,
                 "llm_metadata": llm_result.get("metadata", {}),
                 "firewall_enforcement": {
                     "requested_provider_type": enforcement_result.get(
@@ -273,12 +285,28 @@ class RAGChatService:
         user_message,
         message,
         document_scope_metadata,
+        selected_config=None,
+        selected_grant=None,
     ):
-        llm_result = InternalGeneralAnswerService.generate(
-            message=message,
-            conversation=conversation,
-            current_user_message_uuid=user_message.uuid,
-        )
+        if selected_config is not None:
+            # No document chunks are sent; never imply an evidence-backed answer.
+            llm_result = LLMGatewayService.generate_answer(
+                question=message,
+                retrieved_chunks=[],
+                prompt=(
+                    "You are DOCU-X AI. No company documents were retrieved for this "
+                    "request. Do not invent citations or claim access to documents.\n"
+                    f"User question: {message}"
+                ),
+                provider_config=selected_config,
+                allow_general_answer=True,
+            )
+        else:
+            llm_result = InternalGeneralAnswerService.generate(
+                message=message,
+                conversation=conversation,
+                current_user_message_uuid=user_message.uuid,
+            )
 
         assistant_message = AIMessage.objects.create(
             conversation=conversation,
@@ -293,6 +321,7 @@ class RAGChatService:
             metadata={
                 "document_scope": document_scope_metadata,
                 "document_context_used": False,
+                "selected_model_uuid": str(selected_grant.uuid) if selected_grant else None,
                 "user_message_uuid": str(user_message.uuid),
                 "llm_metadata": llm_result.get("metadata", {}),
             },

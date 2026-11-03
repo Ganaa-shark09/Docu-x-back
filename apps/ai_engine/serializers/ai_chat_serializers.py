@@ -92,6 +92,7 @@ class AIChatRequestSerializer(serializers.Serializer):
     DOCUMENT_SCOPE_SELECTED = "selected"
 
     message = serializers.CharField()
+    model_uuid = serializers.UUIDField(required=False)
     conversation_uuid = serializers.UUIDField(required=False)
     department = serializers.UUIDField(required=False)
     document_type = serializers.CharField(required=False)
