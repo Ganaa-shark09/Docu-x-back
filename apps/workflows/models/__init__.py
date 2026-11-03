@@ -27,7 +27,12 @@ from .hr_policy import (
     HRPolicySection,
     HRPolicyAnswer,
 )
-from .contract import ContractReview, ContractReviewOutput
+from .contract import (
+    ContractReview,
+    ContractReviewOutput,
+    ContractObligationAssignment,
+    ContractObligationEvent,
+)
 from .clauses import (
     ClauseType,
     ClausePlaybook,
@@ -82,6 +87,8 @@ __all__ = [
     "ExtractionRun",
     "ExtractionTemplate",
     "ExtractionTemplateField",
+    "ContractObligationAssignment",
+    "ContractObligationEvent",
 ]
 
 from .engine import (

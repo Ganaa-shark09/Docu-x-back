@@ -1173,3 +1173,221 @@ class ContractWorkflowTests(APITestCase):
                 for o in run.contract_review.normalized["obligations"]
             )
         )
+
+    def test_contract_register_is_paginated_and_filters_without_exposing_raw_content(self):
+        run = self.advance(self.start())
+        root = "/api/workflows/contract-reviews/"
+        listed = self.client.get(root)
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed["Cache-Control"], "no-store")
+        self.assertEqual(listed.data["count"], 1)
+        row = listed.data["results"][0]
+        self.assertEqual(row["uuid"], str(run.contract_review.uuid))
+        self.assertEqual(row["document_title"], self.document.title)
+        self.assertEqual(row["status"], "completed")
+        self.assertNotIn("normalized", row)
+        self.assertNotIn("field_provenance", row)
+        self.assertNotIn("risk_rules", row)
+        self.assertEqual(self.client.get(root, {"search": "unrelated"}).data["count"], 0)
+        self.assertEqual(self.client.get(root, {"status": "completed"}).data["count"], 1)
+        self.assertEqual(self.client.get(root, {"status": "unknown"}).status_code, 400)
+        self.assertEqual(self.client.get(root, {"page_size": 1}).data["count"], 1)
+        summary = self.client.get(root + "summary/")
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(summary.data["total"], 1)
+        self.assertEqual(summary.data["by_status"]["completed"], 1)
+        self.assertEqual(summary.data["needs_attention"], 0)
+        self.assertEqual(self.client.get(root + "summary/", {"search": "missing"}).data["total"], 0)
+
+    def test_contract_register_and_milestones_fail_closed_on_governance_changes(self):
+        run = self.advance(self.start())
+        root = "/api/workflows/contract-reviews/"
+        details = root + str(run.contract_review.uuid) + "/milestones/"
+        milestones = self.client.get(details)
+        self.assertEqual(milestones.status_code, 200)
+        self.assertEqual(milestones["Cache-Control"], "no-store")
+        self.assertTrue(milestones.data["review_output_finalized"])
+        keys = {item["source_field"] for item in milestones.data["milestones"]}
+        self.assertIn("effective_date", keys)
+        self.assertIn("notice_deadline", keys)
+        self.assertTrue(all(item["evidence"] for item in milestones.data["milestones"]))
+        self.assertTrue(all(len(item["date"]) == 10 for item in milestones.data["milestones"]))
+
+        # A different tenant cannot discover counts, titles, or date evidence.
+        self.client.force_authenticate(self.foreign)
+        self.assertEqual(self.client.get(root).data["count"], 0)
+        self.assertEqual(self.client.get(root + "summary/").data["total"], 0)
+        self.assertEqual(self.client.get(details).status_code, 404)
+
+        self.client.force_authenticate(self.admin)
+        DocumentFieldPolicy.objects.create(
+            document=self.document,
+            field_key="contract_value",
+            user=self.admin,
+            can_view=False,
+            can_use_ai=False,
+            can_export=False,
+        )
+        self.assertEqual(self.client.get(root).data["count"], 0)
+        self.assertEqual(self.client.get(root + "summary/").data["total"], 0)
+        self.assertEqual(self.client.get(details).status_code, 403)
+
+    def test_milestones_never_invent_unsourced_dates(self):
+        from apps.workflows.services.contract_milestone_service import ContractMilestoneService
+
+        run = self.advance(self.start())
+        review = run.contract_review
+        fields = review.extraction_run.result_fields
+        field = fields.get(field_key="notice_deadline")
+        field.source_metadata = {**field.source_metadata, "evidence": []}
+        field.save(update_fields=["source_metadata", "updated_at"])
+        review.normalized["renewal_date"] = "2027-02-30"
+        review.save(update_fields=["normalized", "updated_at"])
+        snapshot = ContractMilestoneService.snapshot(review)
+        keys = {item["source_field"] for item in snapshot["milestones"]}
+        self.assertNotIn("notice_deadline", keys)
+        self.assertNotIn("renewal_date", keys)
+
+    def test_obligation_tracking_is_evidence_anchored_and_approved_review_only(self):
+        from apps.workflows.models import ContractObligationAssignment
+
+        root = "/api/workflows/contract-reviews/"
+        queued = self.start()
+        pre = root + str(queued.contract_review.uuid) + "/obligation-tracker/" if hasattr(queued, "contract_review") else None
+        # Processing/review output must exist before legal operations can be assigned.
+        if pre:
+            rejected = self.client.post(pre, {
+                "source_index": 0, "owner_id": self.reviewer.pk,
+                "expected_review_revision": queued.contract_review.revision,
+            }, format="json")
+            self.assertEqual(rejected.status_code, 400)
+        run = self.advance(queued)
+        review = run.contract_review
+        url = root + str(review.uuid) + "/obligation-tracker/"
+        response = self.client.post(url, {
+            "source_index": 0, "owner_id": self.reviewer.pk,
+            "expected_review_revision": review.revision,
+            "action": "Fabricated company duty",
+            "due_date": "2001-01-01",
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+        created = self.client.post(url, {
+            "source_index": 0, "owner_id": self.reviewer.pk,
+            "expected_review_revision": review.revision,
+        }, format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data["owner_id"], self.reviewer.pk)
+        self.assertNotIn("owner_uuid", created.data)
+        self.assertEqual(created.data["events"][0]["actor_id"], self.admin.pk)
+        self.assertNotIn("actor_uuid", created.data["events"][0])
+        self.assertNotEqual(created.data["source_snapshot"]["action"], "Fabricated company duty")
+        self.assertTrue(created.data["source_snapshot"]["evidence"])
+        self.assertEqual(created.data["status"], "open")
+        self.assertEqual(created.data["revision"], 1)
+        self.assertEqual(ContractObligationAssignment.objects.count(), 1)
+        self.assertEqual(self.client.post(url, {
+            "source_index": 0, "owner_id": self.reviewer.pk,
+            "expected_review_revision": review.revision,
+        }, format="json").status_code, 409)
+
+    def test_obligation_progress_is_concurrency_safe_and_actor_restricted(self):
+        run = self.advance(self.start())
+        review = run.contract_review
+        root = f"/api/workflows/contract-reviews/{review.uuid}/obligation-tracker/"
+        created = self.client.post(root, {
+            "source_index": 0, "owner_id": self.reviewer.pk,
+            "expected_review_revision": review.revision,
+        }, format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+        url = root + created.data["uuid"] + "/transition/"
+        self.client.force_authenticate(self.member)
+        self.assertEqual(self.client.post(url, {
+            "status": "in_progress", "expected_revision": 1, "reason": "Working on it",
+        }, format="json").status_code, 403)
+        self.client.force_authenticate(self.reviewer)
+        progress = self.client.post(url, {
+            "status": "in_progress", "expected_revision": 1,
+            "reason": "Owner accepted the follow-up",
+        }, format="json")
+        self.assertEqual(progress.status_code, 200, progress.data)
+        self.assertEqual(progress.data["revision"], 2)
+        self.assertEqual(len(progress.data["events"]), 2)
+        self.assertEqual(self.client.post(url, {
+            "status": "completed", "expected_revision": 1,
+            "reason": "Completed action",
+        }, format="json").status_code, 409)
+        closed = self.client.post(url, {
+            "status": "completed", "expected_revision": 2,
+            "reason": "Owner attests the action is complete",
+        }, format="json")
+        self.assertEqual(closed.status_code, 200, closed.data)
+        self.assertEqual(closed.data["status"], "completed")
+        self.assertEqual(len(closed.data["events"]), 3)
+        self.assertEqual(self.client.post(url, {
+            "status": "completed", "expected_revision": 3,
+            "reason": "Repeated completion",
+        }, format="json").status_code, 400)
+        self.assertEqual(run.status, "completed")  # Workflow state is independent.
+
+    def test_obligation_tracker_revocation_tenant_isolation_and_stale_source(self):
+        run = self.advance(self.start())
+        review = run.contract_review
+        url = f"/api/workflows/contract-reviews/{review.uuid}/obligation-tracker/"
+        created = self.client.post(url, {
+            "source_index": 0, "owner_id": self.reviewer.pk,
+            "expected_review_revision": review.revision,
+        }, format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+        command = url + created.data["uuid"] + "/transition/"
+        self.client.force_authenticate(self.foreign)
+        self.assertEqual(self.client.get(url).status_code, 404)
+        self.assertEqual(self.client.post(command, {
+            "status": "in_progress", "expected_revision": 1,
+            "reason": "Out of tenant",
+        }, format="json").status_code, 404)
+        self.client.force_authenticate(self.admin)
+        DocumentFieldPolicy.objects.create(
+            document=self.document, field_key="contract_value", user=self.admin,
+            can_view=False, can_use_ai=False, can_export=False,
+        )
+        self.assertEqual(self.client.get(url).status_code, 403)
+        self.assertEqual(self.client.post(command, {
+            "status": "in_progress", "expected_revision": 1,
+            "reason": "Permission revoked",
+        }, format="json").status_code, 403)
+        DocumentFieldPolicy.objects.filter(document=self.document, user=self.admin).delete()
+        review.revision += 1
+        review.save(update_fields=["revision", "updated_at"])
+        self.assertTrue(self.client.get(url).data[0]["stale"])
+        self.assertEqual(self.client.post(command, {
+            "status": "in_progress", "expected_revision": 1,
+            "reason": "Stale review",
+        }, format="json").status_code, 409)
+
+    def test_obligation_creation_requires_authorized_owner_and_current_source_proof(self):
+        run = self.advance(self.start())
+        review = run.contract_review
+        url = f"/api/workflows/contract-reviews/{review.uuid}/obligation-tracker/"
+        self.assertEqual(self.client.post(url, {
+            "source_index": 0, "owner_id": self.foreign.pk,
+            "expected_review_revision": review.revision,
+        }, format="json").status_code, 400)
+        self.assertEqual(self.client.post(url, {
+            "source_index": 999, "owner_id": self.reviewer.pk,
+            "expected_review_revision": review.revision,
+        }, format="json").status_code, 400)
+        self.assertEqual(self.client.post(url, {
+            "source_index": 0, "owner_id": self.reviewer.pk,
+            "expected_review_revision": review.revision + 1,
+        }, format="json").status_code, 409)
+        field = review.extraction_run.result_fields.get(field_key="obligations")
+        field.source_metadata = {**field.source_metadata, "evidence": []}
+        field.save(update_fields=["source_metadata", "updated_at"])
+        data = review.normalized.copy()
+        data["obligations"] = [dict(item, evidence=[]) for item in data["obligations"]]
+        review.normalized = data
+        review.save(update_fields=["normalized", "updated_at"])
+        self.assertEqual(self.client.post(url, {
+            "source_index": 0, "owner_id": self.reviewer.pk,
+            "expected_review_revision": review.revision,
+        }, format="json").status_code, 400)

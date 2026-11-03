@@ -51,3 +51,69 @@ class ContractReviewOutput(ImmutableVersionPart):
                 fields=["contract_review", "revision"], name="contract_output_revision"
             )
         ]
+
+
+class ContractObligationAssignment(BaseModel):
+    """Human-owned follow-up on a frozen, evidence-backed contract review row.
+
+    Not an execution/signature record or an assertion that a legal duty was met.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        IN_PROGRESS = "in_progress", "In progress"
+        COMPLETED = "completed", "Completed (attested)"
+
+    company = models.ForeignKey("tenants.Company", on_delete=models.PROTECT)
+    review = models.ForeignKey(
+        ContractReview, on_delete=models.PROTECT, related_name="obligation_assignments"
+    )
+    owner = models.ForeignKey(
+        "accounts.User", on_delete=models.PROTECT, related_name="contract_obligations"
+    )
+    created_by = models.ForeignKey(
+        "accounts.User", null=True, on_delete=models.SET_NULL,
+        related_name="contract_obligations_created",
+    )
+    source_revision = models.PositiveIntegerField()
+    source_index = models.PositiveIntegerField()
+    source_digest = models.CharField(max_length=64)
+    source_snapshot = models.JSONField(default=dict)
+    governance_revision = models.PositiveIntegerField()
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.OPEN
+    )
+    revision = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["review", "source_revision", "source_index"],
+                name="contract_obligation_source_unique",
+            )
+        ]
+        indexes = [models.Index(fields=["company", "status"], name="contract_ob_company_a35396_idx")]
+
+
+class ContractObligationEvent(ImmutableVersionPart):
+    """Append-only attestation/assignment history, with no confidential text."""
+
+    obligation = models.ForeignKey(
+        ContractObligationAssignment, on_delete=models.PROTECT, related_name="events"
+    )
+    actor = models.ForeignKey(
+        "accounts.User", null=True, on_delete=models.SET_NULL
+    )
+    sequence = models.PositiveIntegerField()
+    from_status = models.CharField(max_length=20, blank=True)
+    to_status = models.CharField(max_length=20)
+    reason = models.CharField(max_length=500)
+
+    class Meta:
+        ordering = ["sequence"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["obligation", "sequence"],
+                name="contract_obligation_event_sequence",
+            )
+        ]
